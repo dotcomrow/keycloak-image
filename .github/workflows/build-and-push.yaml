@@ -161,36 +161,47 @@ jobs:
             create "authentication/flows/$FLOW/executions/execution" -r "$REALM" \
             -s provider="$PROVIDER_ID"
 
-          echo "Set REQUIRED requirement (with retry)..."
+          echo "Discover execution id..."
           EID=""
-          for i in {1..20}; do
+          for i in {1..40}; do
             EXECS=$(docker exec kc /opt/keycloak/bin/kcadm.sh \
                       get "authentication/flows/$FLOW/executions" -r "$REALM" || echo "[]")
-            # find the id for the row whose providerId == PROVIDER_ID
             EID=$(echo "$EXECS" | tr -d '\n' | sed 's/},[[:space:]]*{/}\n{/g' \
               | awk -v id="$PROVIDER_ID" '
                   /"providerId"[[:space:]]*:[[:space:]]*"/ {p=$0}
                   /"id"[[:space:]]*:/ && p ~ ("\"" id "\"") {match($0, /"id"[[:space:]]*:[[:space:]]*"([^"]+)"/, m); print m[1]; exit}
                 ')
-            if [ -n "$EID" ]; then
-              # try to set requirement; if it 404s due to propagation, retry
-              if docker exec kc /opt/keycloak/bin/kcadm.sh update "authentication/executions/$EID" -r "$REALM" -s 'requirement=REQUIRED'; then
-                break
-              fi
+            [ -n "$EID" ] && break || sleep 1
+          done
+          [ -n "${EID:-}" ] || { echo "❌ Could not discover execution id for '$PROVIDER_ID'"; exit 1; }
+          echo "Execution id: $EID"
+
+          echo "Set REQUIRED requirement (execution endpoint, with retries)..."
+          ok=""
+          for i in {1..10}; do
+            if docker exec kc /opt/keycloak/bin/kcadm.sh update "authentication/executions/$EID" -r "$REALM" -s 'requirement=REQUIRED'; then
+              ok="yes"; break
+            else
+              echo "   (attempt $i) execution endpoint not ready; retrying..."
+              sleep 1
             fi
-            sleep 1
           done
 
-          if [ -z "${EID:-}" ]; then
-            echo "❌ Could not discover execution id for provider '$PROVIDER_ID'."; exit 1
+          if [ -z "$ok" ]; then
+            echo "Falling back to flow-level update endpoint..."
+            # Some KC versions require updating via flow alias endpoint
+            cat > /tmp/req.json <<JSON
+          { "id": "$EID", "requirement": "REQUIRED" }
+          JSON
+            docker exec -i kc /opt/keycloak/bin/kcadm.sh update "authentication/flows/$FLOW/executions" -r "$REALM" -f - < /tmp/req.json
           fi
 
-          # final verification
+          echo "Verify requirement..."
           docker exec kc /opt/keycloak/bin/kcadm.sh \
             get "authentication/flows/$FLOW/executions" -r "$REALM" \
-            | grep -A2 "\"id\"[[:space:]]*:[[:space:]]*\"$EID\"" \
-            | grep -q '"requirement"[[:space:]]*:[[:space:]]*"REQUIRED"'
-
+            | awk -v id="$EID" -v RS='},' '
+                $0 ~ "\"id\"[[:space:]]*:[[:space:]]*\"" id "\"" && $0 ~ "\"requirement\"[[:space:]]*:[[:space:]]*\"REQUIRED\"" {found=1}
+                END {exit (found?0:1)}'
           echo "✅ Provider present and REQUIRED under flow '$FLOW'."
 
       - name: Push image
