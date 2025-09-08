@@ -13,9 +13,7 @@ on:
         default: "24.0.5"
 
 env:
-  # Adjust for your registry. Examples:
-  #   ghcr.io/ORG/REPO
-  #   docker.io/YOUR_DOCKERHUB_USER/keycloak-github-admin
+  # Example: ghcr.io/OWNER/REPO
   IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
   KEYCLOAK_VERSION: ${{ inputs.keycloak_version || '24.0.5' }}
 
@@ -48,18 +46,17 @@ jobs:
             type=raw,value=${{ env.KEYCLOAK_VERSION }}
             type=sha
 
-      # Login to GHCR with GITHUB_TOKEN; use OWNER as the username
+      # Login to GHCR with GITHUB_TOKEN (skip on PRs)
       - name: Log in to GHCR
         if: ${{ github.event_name != 'pull_request' }}
+        id: registry
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: false
-        id: registry
 
-      # Build but do not push yet; load into Docker engine for tests
+      # Build but do not push; load into local Docker for tests
       - name: Build image (no push)
         uses: docker/build-push-action@v6
         with:
@@ -71,9 +68,21 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
+      # Choose one of the built tags for docker run (first line from metadata-action)
+      - name: Select local test tag
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          # Use the first tag produced by metadata-action
+          IMG="$(printf '%s\n' "$TAGS" | head -n1)"
+          echo "IMG=$IMG" >> $GITHUB_ENV
+          echo "Using test image tag: $IMG"
+
       # Spin up an ephemeral Postgres
       - name: Start Postgres
         run: |
+          set -euo pipefail
           docker network create kc-net
           docker run -d --rm --name kc-db --network kc-net \
             -e POSTGRES_USER=keycloak \
@@ -84,12 +93,12 @@ jobs:
           for i in {1..60}; do
             docker exec kc-db pg_isready -U keycloak -d keycloak && break || sleep 2
           done
+          docker exec kc-db pg_isready -U keycloak -d keycloak
 
       # Start our freshly built Keycloak image
       - name: Start Keycloak (under test)
         run: |
-          # pick the first tag emitted by metadata-action (contains sha)
-          IMG="$(echo '${{ steps.meta.outputs.tags }}' | head -n1)"
+          set -euo pipefail
           docker run -d --rm --name kc --network kc-net -p 8080:8080 \
             -e KC_DB=postgres \
             -e KC_DB_URL=jdbc:postgresql://kc-db:5432/keycloak \
@@ -98,6 +107,7 @@ jobs:
             -e KC_DB_SCHEMA=public \
             -e DEBUG_ALWAYS_GRANT=true \
             "$IMG"
+
           # wait for readiness
           for i in {1..120}; do
             curl -fsS http://localhost:8080/health/ready && break || sleep 2
@@ -173,6 +183,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
+      # Always tear down; also upload logs on failure
       - name: Teardown
         if: always()
         run: |
@@ -180,3 +191,19 @@ jobs:
           docker logs kc-db || true
           docker rm -f kc kc-db || true
           docker network rm kc-net || true
+
+      - name: Upload logs (failure)
+        if: failure()
+        run: |
+          docker logs kc > kc.log 2>&1 || true
+          docker logs kc-db > kc-db.log 2>&1 || true
+        continue-on-error: true
+
+      - name: Publish logs artifact (failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keycloak-ci-logs
+          path: |
+            kc.log
+            kc-db.log
