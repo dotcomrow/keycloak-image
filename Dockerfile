@@ -36,7 +36,7 @@ RUN mkdir -p /opt/keycloak/data \
 USER 1000
 
 # Build once so provider is wired in; no --auto-build at runtime
-RUN /opt/keycloak/bin/kc.sh build
+RUN /opt/keycloak/bin/kc.sh build --db=postgres --features=scripts
 
 # default command; hostname checks relaxed for CI
 ENTRYPOINT ["/opt/keycloak/bin/kc.sh", "start", "--http-enabled=true", "--hostname-strict=false"]
