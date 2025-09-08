@@ -13,16 +13,17 @@ on:
         default: "24.0.5"
 
 env:
-  # Example: ghcr.io/OWNER/REPO
   IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
   KEYCLOAK_VERSION: ${{ inputs.keycloak_version || '24.0.5' }}
+  # Change this if your AuthenticatorFactory.getId() differs
+  PROVIDER_ID: github-team-admin
 
 jobs:
   build-test-push:
     runs-on: ubuntu-22.04
     permissions:
       contents: read
-      packages: write  # needed for GHCR
+      packages: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,7 +47,6 @@ jobs:
             type=raw,value=${{ env.KEYCLOAK_VERSION }}
             type=sha
 
-      # Login to GHCR with GITHUB_TOKEN (skip on PRs)
       - name: Log in to GHCR
         if: ${{ github.event_name != 'pull_request' }}
         id: registry
@@ -56,7 +56,6 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build but do not push; load into local Docker for tests
       - name: Build image (no push)
         uses: docker/build-push-action@v6
         with:
@@ -68,18 +67,15 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      # Choose one of the built tags for docker run (first line from metadata-action)
       - name: Select local test tag
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
-          # Use the first tag produced by metadata-action
           IMG="$(printf '%s\n' "$TAGS" | head -n1)"
           echo "IMG=$IMG" >> $GITHUB_ENV
           echo "Using test image tag: $IMG"
 
-      # Spin up an ephemeral Postgres
       - name: Start Postgres
         run: |
           set -euo pipefail
@@ -95,7 +91,6 @@ jobs:
           done
           docker exec kc-db pg_isready -U keycloak -d keycloak
 
-      # Start our freshly built Keycloak image
       - name: Start Keycloak (under test)
         run: |
           set -euo pipefail
@@ -107,63 +102,69 @@ jobs:
             -e KC_DB_SCHEMA=public \
             -e DEBUG_ALWAYS_GRANT=true \
             "$IMG"
-
-          # wait for readiness
           for i in {1..120}; do
             curl -fsS http://localhost:8080/health/ready && break || sleep 2
           done
           curl -fsS http://localhost:8080/health/ready
 
-      # Prove the provider is loaded and attachable to a flow
+      - name: Verify provider jar present in container
+        run: |
+          set -euo pipefail
+          echo "Listing /opt/keycloak/providers in container:"
+          docker exec kc bash -lc 'ls -l /opt/keycloak/providers || true'
+          # Hard fail if no jar is present
+          COUNT=$(docker exec kc bash -lc 'shopt -s nullglob; set -- /opt/keycloak/providers/*.jar; echo $#')
+          if [ "$COUNT" -eq 0 ]; then
+            echo "❌ No JARs found under /opt/keycloak/providers. Your Dockerfile may not be copying the artifact name you expect."
+            exit 1
+          fi
+
       - name: Prove provider works via kcadm
         run: |
           set -euo pipefail
           SERVER=http://localhost:8080
           REALM=master
           FLOW="GitHub-PostLogin"
-          PROVIDER_ID="github-team-admin"
 
+          # Authenticate
           docker exec kc /opt/keycloak/bin/kcadm.sh config credentials \
             --server "$SERVER" --realm "$REALM" \
             --user admin --password admin
 
           echo "Check provider is present..."
-          docker exec kc /opt/keycloak/bin/kcadm.sh \
-            get authentication/authenticator-providers -r "$REALM" \
-            | grep -q "\"id\" : \"$PROVIDER_ID\""
+          # Use jq to robustly parse IDs and print diagnostics on failure
+          PROVIDERS_JSON="$(docker exec kc /opt/keycloak/bin/kcadm.sh get authentication/authenticator-providers -r "$REALM")"
+          echo "$PROVIDERS_JSON" | jq -r '.[].id' | tee /tmp/provider_ids.txt
+          if ! grep -xq "${{ env.PROVIDER_ID }}" /tmp/provider_ids.txt; then
+            echo "❌ Provider id '${{ env.PROVIDER_ID }}' not found. Registered IDs were:"
+            cat /tmp/provider_ids.txt
+            exit 1
+          fi
 
           echo "Create or reset flow..."
           if ! docker exec kc /opt/keycloak/bin/kcadm.sh get authentication/flows -r "$REALM" \
-               | grep -q "\"alias\" : \"$FLOW\""; then
+               | jq -r '.[].alias' | grep -xq "$FLOW"; then
             docker exec kc /opt/keycloak/bin/kcadm.sh create authentication/flows -r "$REALM" \
               -s "alias=$FLOW" -s "providerId=basic-flow" -s "topLevel=true" -s "builtIn=false" \
               -s 'description=Grant realm-admin to members of a GitHub team'
           fi
 
-          # purge any existing executions
-          EXECS=$(docker exec kc /opt/keycloak/bin/kcadm.sh get "authentication/flows/$FLOW/executions" -r "$REALM" || echo "[]")
-          IDS=$(echo "$EXECS" | tr -d '\n' | sed 's/},[[:space:]]*{/}\n{/g' \
-            | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
-          if [ -n "$IDS" ]; then
-            while read -r EID; do
-              [ -n "$EID" ] && docker exec kc /opt/keycloak/bin/kcadm.sh delete "authentication/executions/$EID" -r "$REALM" || true
-            done <<<"$IDS"
-          fi
+          echo "Purge existing executions..."
+          EXECS_JSON=$(docker exec kc /opt/keycloak/bin/kcadm.sh get "authentication/flows/$FLOW/executions" -r "$REALM" || echo "[]")
+          echo "$EXECS_JSON" | jq -r '.[].id' | while read -r EID; do
+            [ -n "$EID" ] && docker exec kc /opt/keycloak/bin/kcadm.sh delete "authentication/executions/$EID" -r "$REALM" || true
+          done
 
-          # add our provider
+          echo "Add our provider as execution..."
           docker exec kc /opt/keycloak/bin/kcadm.sh \
             create "authentication/flows/$FLOW/executions/execution" -r "$REALM" \
-            -s provider="$PROVIDER_ID"
+            -s provider="${{ env.PROVIDER_ID }}"
 
-          # set REQUIRED
+          echo "Set REQUIRED requirement..."
           for i in {1..20}; do
             EID=$(docker exec kc /opt/keycloak/bin/kcadm.sh \
               get "authentication/flows/$FLOW/executions" -r "$REALM" \
-              | tr -d '\n' | sed 's/},[[:space:]]*{/}\n{/g' \
-              | awk -v id="$PROVIDER_ID" '
-                /"providerId"[[:space:]]*:[[:space:]]*"/ {p=$0}
-                /"id"[[:space:]]*:/ && p ~ id {match($0, /"id"[[:space:]]*:[[:space:]]*"([^"]+)"/, m); print m[1]; exit}
-              ')
+              | jq -r '.[] | select(.providerId=="'${{ env.PROVIDER_ID }}'") | .id' | head -n1)
             [ -n "$EID" ] && break || sleep 1
           done
           [ -n "${EID:-}" ]
@@ -171,7 +172,6 @@ jobs:
 
           echo "✅ Provider present and attached successfully."
 
-      # Only push after proof passes AND it's not a PR
       - name: Push image
         if: ${{ github.event_name != 'pull_request' }}
         uses: docker/build-push-action@v6
@@ -183,7 +183,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      # Always tear down; also upload logs on failure
       - name: Teardown
         if: always()
         run: |
