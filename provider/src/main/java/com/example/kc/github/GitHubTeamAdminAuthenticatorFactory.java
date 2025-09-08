@@ -9,7 +9,9 @@ import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.AuthenticationExecutionModel;
 import org.keycloak.provider.ProviderConfigProperty;
 import java.util.List;
+import com.google.auto.service.AutoService;
 
+@AutoService(AuthenticatorFactory.class)
 public class GitHubTeamAdminAuthenticatorFactory implements AuthenticatorFactory {
     public static final String ID = "github-team-admin";
 

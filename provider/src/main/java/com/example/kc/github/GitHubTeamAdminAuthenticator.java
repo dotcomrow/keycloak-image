@@ -89,9 +89,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
     }
 
     private void ensureOnlyIfMember(UserModel user, RoleModel adminRole, boolean isMember) {
-        Set<RoleModel> current = user.getRoleMappingsStream().collect(Collectors.toSet());
-        boolean has = current.contains(adminRole);
-
+        boolean has = user.hasRole(adminRole);
         if (isMember && !has) {
             user.grantRole(adminRole);
             LOG.infof("Granted realm-admin to %s", user.getUsername());
