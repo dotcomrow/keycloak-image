@@ -125,52 +125,73 @@ jobs:
           SERVER=http://localhost:8080
           REALM=master
           FLOW="GitHub-PostLogin"
+          PROVIDER_ID="github-team-admin"
 
-          # Authenticate
           docker exec kc /opt/keycloak/bin/kcadm.sh config credentials \
             --server "$SERVER" --realm "$REALM" \
             --user admin --password admin
 
           echo "Check provider is present..."
-          # Use jq to robustly parse IDs and print diagnostics on failure
-          PROVIDERS_JSON="$(docker exec kc /opt/keycloak/bin/kcadm.sh get authentication/authenticator-providers -r "$REALM")"
-          echo "$PROVIDERS_JSON" | jq -r '.[].id' | tee /tmp/provider_ids.txt
-          if ! grep -xq "${{ env.PROVIDER_ID }}" /tmp/provider_ids.txt; then
-            echo "❌ Provider id '${{ env.PROVIDER_ID }}' not found. Registered IDs were:"
-            cat /tmp/provider_ids.txt
-            exit 1
-          fi
+          LIST=$(docker exec kc /opt/keycloak/bin/kcadm.sh \
+                   get authentication/authenticator-providers -r "$REALM")
+          echo "$LIST" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+          echo "$LIST" | grep -q "\"id\"[[:space:]]*:[[:space:]]*\"$PROVIDER_ID\"" || {
+            echo "❌ Provider id '$PROVIDER_ID' not found."; exit 1; }
 
           echo "Create or reset flow..."
           if ! docker exec kc /opt/keycloak/bin/kcadm.sh get authentication/flows -r "$REALM" \
-               | jq -r '.[].alias' | grep -xq "$FLOW"; then
+               | grep -q "\"alias\"[[:space:]]*:[[:space:]]*\"$FLOW\""; then
             docker exec kc /opt/keycloak/bin/kcadm.sh create authentication/flows -r "$REALM" \
               -s "alias=$FLOW" -s "providerId=basic-flow" -s "topLevel=true" -s "builtIn=false" \
               -s 'description=Grant realm-admin to members of a GitHub team'
           fi
 
           echo "Purge existing executions..."
-          EXECS_JSON=$(docker exec kc /opt/keycloak/bin/kcadm.sh get "authentication/flows/$FLOW/executions" -r "$REALM" || echo "[]")
-          echo "$EXECS_JSON" | jq -r '.[].id' | while read -r EID; do
-            [ -n "$EID" ] && docker exec kc /opt/keycloak/bin/kcadm.sh delete "authentication/executions/$EID" -r "$REALM" || true
-          done
+          EXECS=$(docker exec kc /opt/keycloak/bin/kcadm.sh get "authentication/flows/$FLOW/executions" -r "$REALM" || echo "[]")
+          IDS=$(echo "$EXECS" | tr -d '\n' | sed 's/},[[:space:]]*{/}\n{/g' \
+            | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+          if [ -n "$IDS" ]; then
+            while read -r EID; do
+              [ -n "$EID" ] && docker exec kc /opt/keycloak/bin/kcadm.sh delete "authentication/executions/$EID" -r "$REALM" || true
+            done <<<"$IDS"
+          fi
 
           echo "Add our provider as execution..."
           docker exec kc /opt/keycloak/bin/kcadm.sh \
             create "authentication/flows/$FLOW/executions/execution" -r "$REALM" \
-            -s provider="${{ env.PROVIDER_ID }}"
+            -s provider="$PROVIDER_ID"
 
-          echo "Set REQUIRED requirement..."
+          echo "Set REQUIRED requirement (with retry)..."
+          EID=""
           for i in {1..20}; do
-            EID=$(docker exec kc /opt/keycloak/bin/kcadm.sh \
-              get "authentication/flows/$FLOW/executions" -r "$REALM" \
-              | jq -r '.[] | select(.providerId=="'${{ env.PROVIDER_ID }}'") | .id' | head -n1)
-            [ -n "$EID" ] && break || sleep 1
+            EXECS=$(docker exec kc /opt/keycloak/bin/kcadm.sh \
+                      get "authentication/flows/$FLOW/executions" -r "$REALM" || echo "[]")
+            # find the id for the row whose providerId == PROVIDER_ID
+            EID=$(echo "$EXECS" | tr -d '\n' | sed 's/},[[:space:]]*{/}\n{/g' \
+              | awk -v id="$PROVIDER_ID" '
+                  /"providerId"[[:space:]]*:[[:space:]]*"/ {p=$0}
+                  /"id"[[:space:]]*:/ && p ~ ("\"" id "\"") {match($0, /"id"[[:space:]]*:[[:space:]]*"([^"]+)"/, m); print m[1]; exit}
+                ')
+            if [ -n "$EID" ]; then
+              # try to set requirement; if it 404s due to propagation, retry
+              if docker exec kc /opt/keycloak/bin/kcadm.sh update "authentication/executions/$EID" -r "$REALM" -s 'requirement=REQUIRED'; then
+                break
+              fi
+            fi
+            sleep 1
           done
-          [ -n "${EID:-}" ]
-          docker exec kc /opt/keycloak/bin/kcadm.sh update "authentication/executions/$EID" -r "$REALM" -s 'requirement=REQUIRED'
 
-          echo "✅ Provider present and attached successfully."
+          if [ -z "${EID:-}" ]; then
+            echo "❌ Could not discover execution id for provider '$PROVIDER_ID'."; exit 1
+          fi
+
+          # final verification
+          docker exec kc /opt/keycloak/bin/kcadm.sh \
+            get "authentication/flows/$FLOW/executions" -r "$REALM" \
+            | grep -A2 "\"id\"[[:space:]]*:[[:space:]]*\"$EID\"" \
+            | grep -q '"requirement"[[:space:]]*:[[:space:]]*"REQUIRED"'
+
+          echo "✅ Provider present and REQUIRED under flow '$FLOW'."
 
       - name: Push image
         if: ${{ github.event_name != 'pull_request' }}
