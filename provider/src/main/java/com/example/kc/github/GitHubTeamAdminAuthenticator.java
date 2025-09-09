@@ -16,31 +16,29 @@ import java.util.stream.Collectors;
  * Primary behavior:
  *  - If user is in GITHUB_ORG/GITHUB_TEAM (or allow-listed or DEBUG_ALWAYS_GRANT=true),
  *    grant *all roles in the realm* (realm + every client role).
- *  - Optionally, additional team→role mappings via GITHUB_ROLE_MAP (JSON).
+ *  - Optional extra team→role mappings via GITHUB_ROLE_MAP (JSON).
  *  - Optional excludes via GITHUB_ADMIN_EXCLUDE.
  *  - Optional revocation (GITHUB_STRICT_REVOKE=true) removes previously granted roles
  *    when user is not in the admin team.
  *
- * Environment variables:
- *   GITHUB_ORG / GITHUB_TEAM              :: primary "god-mode" team (required for normal operation)
- *   DEBUG_ALWAYS_GRANT=true|false         :: bypass membership checks and grant admin (default: false)
- *   GITHUB_ADMIN_USERNAMES="a,b,c"        :: comma-separated GH usernames that always get admin
- *   GITHUB_STRICT_REVOKE=true|false       :: revoke non-target roles when not admin (default: true)
+ * Env:
+ *   GITHUB_ORG / GITHUB_TEAM
+ *   DEBUG_ALWAYS_GRANT=true|false
+ *   GITHUB_ADMIN_USERNAMES="a,b,c"
+ *   GITHUB_STRICT_REVOKE=true|false (default true)
  *   GITHUB_ROLE_MAP='{"org/team":["realm:ROLE","client:CID:ROLE"]}'
- *   GITHUB_ADMIN_EXCLUDE="realm:R1,client:CID:R2,R3"  (bare name treated as realm role)
+ *   GITHUB_ADMIN_EXCLUDE="realm:R1,client:CID:R2,R3"
  *
- * Notes:
- *   - GitHub IdP should have storeToken=true and scopes incl. "read:org".
- *   - This class logs HTTP status and a truncated body for GitHub calls to aid debugging.
+ * GitHub IdP tips:
+ *   - Set storeToken=true
+ *   - Include "read:org" in default scopes
+ *   - If your org enforces SAML/SSO, authorize your OAuth app/token for the org
  */
 public class GitHubTeamAdminAuthenticator implements Authenticator {
     private static final Logger LOG = Logger.getLogger(GitHubTeamAdminAuthenticator.class);
 
-    // ---------- config helpers ----------
-    private static String getenv(String k, String def) {
-        String v = System.getenv(k);
-        return v != null ? v : def;
-    }
+    // ---------- config ----------
+    private static String getenv(String k, String def) { String v = System.getenv(k); return v != null ? v : def; }
     private static boolean isTrue(String k, boolean def) {
         String v = getenv(k, def ? "true" : "false");
         return "true".equalsIgnoreCase(v) || "1".equals(v);
@@ -51,7 +49,6 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
     private static boolean strictRevoke()     { return isTrue("GITHUB_STRICT_REVOKE", true); }
     private static String roleMapJson()       { return getenv("GITHUB_ROLE_MAP", "").trim(); }
     private static String excludeCsv()        { return getenv("GITHUB_ADMIN_EXCLUDE", "").trim(); }
-
     private static Set<String> adminUsernames() {
         String csv = getenv("GITHUB_ADMIN_USERNAMES", "").trim();
         if (csv.isEmpty()) return Collections.emptySet();
@@ -63,7 +60,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         return s;
     }
 
-    // ---------- main entry ----------
+    // ---------- main ----------
     @Override
     public void authenticate(AuthenticationFlowContext ctx) {
         try {
@@ -77,10 +74,9 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             final boolean flagRevoke = strictRevoke();
             final Set<String> allowUsers = adminUsernames();
 
-            LOG.infof("GitHubTeamAdminAuthenticator: start for user=%s realm=%s org=%s team=%s DEBUG_ALWAYS_GRANT=%s STRICT_REVOKE=%s allowUsers=%s",
+            LOG.infof("GitHubTeamAdminAuthenticator: start user=%s realm=%s org=%s team=%s DEBUG_ALWAYS_GRANT=%s STRICT_REVOKE=%s allowUsers=%s",
                     user.getUsername(), realm.getName(), safe(org), safe(team), flagAlways, flagRevoke, allowUsers);
 
-            // Determine admin membership / bypasses
             boolean adminMember = flagAlways
                     || allowUsers.contains(user.getUsername().toLowerCase(Locale.ROOT))
                     || isMemberOf(session, realm, user, org, team);
@@ -89,17 +85,16 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
 
             // Build target role set
             Set<RoleModel> target = new LinkedHashSet<>();
-
             if (adminMember) {
                 Set<RoleModel> all = allRolesInRealm(realm);
                 target.addAll(all);
-                LOG.infof("Admin grant: collected %d total roles to grant (realm + clients).", all.size());
+                LOG.infof("Admin grant: collected %d total roles (realm + client).", all.size());
             }
 
-            // Optional extra team-to-roles map
+            // Optional extra maps
             Map<String, List<RoleSpec>> map = parseRoleMap(roleMapJson());
             if (!map.isEmpty()) {
-                Set<String> myTeams = fetchTeams(session, realm, user); // "org/team" lowercase
+                Set<String> myTeams = fetchTeams(session, realm, user); // "org/team"
                 LOG.infof("Extra role map: user teams=%s", myTeams);
                 for (String key : myTeams) {
                     List<RoleSpec> wants = map.get(key);
@@ -124,14 +119,14 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
                 LOG.infof("Excludes applied: removed %d role(s) from target", (before - target.size()));
             }
 
-            // Apply grants
+            // Grant
             if (!target.isEmpty()) {
                 grantIfMissing(user, target);
             } else {
                 LOG.infof("No target roles to grant for user=%s", user.getUsername());
             }
 
-            // Optional revoke (only if NOT adminMember)
+            // Revoke (only when NOT admin)
             if (!adminMember && flagRevoke) {
                 Set<RoleModel> grantable = new LinkedHashSet<>(allRolesInRealm(realm));
                 for (List<RoleSpec> specs : map.values()) {
@@ -141,19 +136,19 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
                     }
                 }
                 if (!excludes.isEmpty()) grantable.removeIf(r -> excludeMatch(r, excludes));
-                LOG.infof("Revocation pass: considering %d role(s) as revocable universe.", grantable.size());
+                LOG.infof("Revocation pass: considering %d role(s).", grantable.size());
                 revokeIfPresent(user, grantable);
             }
 
             ctx.success();
-            LOG.infof("GitHubTeamAdminAuthenticator: success for user=%s", user.getUsername());
+            LOG.infof("GitHubTeamAdminAuthenticator: success user=%s", user.getUsername());
         } catch (Exception e) {
             LOG.error("GitHubTeamAdminAuthenticator: exception — allowing login (non-blocking).", e);
-            ctx.success(); // never hard-fail login
+            ctx.success();
         }
     }
 
-    // ---------- membership logic ----------
+    // ---------- membership ----------
     private boolean isMemberOf(KeycloakSession session, RealmModel realm, UserModel user, String org, String team) {
         if (org.isBlank() || team.isBlank()) {
             LOG.warn("GITHUB_ORG or GITHUB_TEAM is blank; cannot determine membership.");
@@ -161,13 +156,13 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         }
         if (debugAlwaysGrant()) return true;
 
-        String token = fetchGithubToken(session, realm, user);
+        String token = extractGithubAccessToken(session, realm, user);
         if (token == null || token.isBlank()) {
-            LOG.warn("No GitHub token; ensure IdP has storeToken=true and scope includes read:org.");
+            LOG.warn("No usable GitHub access token; ensure storeToken=true and scope includes read:org.");
             return false;
         }
 
-        // 1) Try /user/teams
+        // 1) /user/teams
         try {
             var resp = SimpleHttp
                     .doGet("https://api.github.com/user/teams", session)
@@ -199,7 +194,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             LOG.warn("GitHub /user/teams threw; will try membership fallback.", e);
         }
 
-        // 2) Fallback: explicit membership endpoint
+        // 2) explicit membership fallback
         try {
             String url = String.format("https://api.github.com/orgs/%s/teams/%s/memberships/%s",
                     org, team, user.getUsername());
@@ -220,29 +215,53 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             } else if (sc == 404) {
                 LOG.info("Membership endpoint says not found (not a member).");
                 return false;
-            } // other statuses are treated as non-member with logs above
+            }
         } catch (Exception e) {
             LOG.warn("GitHub membership fallback threw.", e);
         }
-
         return false;
     }
 
-    private String fetchGithubToken(KeycloakSession session, RealmModel realm, UserModel user) {
+    /**
+     * Extract a usable GitHub access token from the federated identity record.
+     * Some brokers store a raw token string; others store a JSON blob containing "access_token".
+     */
+    private String extractGithubAccessToken(KeycloakSession session, RealmModel realm, UserModel user) {
         try {
             FederatedIdentityModel fi = session.users().getFederatedIdentity(realm, user, "github");
-            String present = (fi != null && fi.getToken() != null && !fi.getToken().isBlank()) ? "present" : "absent";
-            LOG.infof("Federated token for provider=github is %s for user=%s", present, user.getUsername());
-            return fi != null ? fi.getToken() : null;
+            if (fi == null) {
+                LOG.infof("No federated identity record for provider=github (user=%s)", user.getUsername());
+                return null;
+            }
+            String raw = fi.getToken();
+            String desc = (raw == null) ? "null" : (raw.startsWith("{") ? "JSON" : (raw.contains(".") ? "JWT-ish" : "opaque"));
+            LOG.infof("Federated token shape for user=%s: %s (len=%d)", user.getUsername(), desc, raw == null ? 0 : raw.length());
+
+            if (raw == null || raw.isBlank()) return null;
+
+            if (raw.startsWith("{")) {
+                // Likely a full token response; extract access_token
+                JsonNode n = parseJsonQuiet(raw);
+                String at = (n != null) ? n.path("access_token").asText(null) : null;
+                if (at != null && !at.isBlank()) {
+                    LOG.info("Extracted access_token from JSON federated token.");
+                    return at;
+                } else {
+                    LOG.warn("Federated JSON token had no access_token; falling back to raw.");
+                    return raw;
+                }
+            }
+            // Otherwise assume it's an opaque bearer token already
+            return raw;
         } catch (Exception e) {
-            LOG.warn("Error fetching federated identity token.", e);
+            LOG.warn("Error extracting GitHub access token.", e);
             return null;
         }
     }
 
     private Set<String> fetchTeams(KeycloakSession session, RealmModel realm, UserModel user) {
         Set<String> out = new HashSet<>();
-        String token = fetchGithubToken(session, realm, user);
+        String token = extractGithubAccessToken(session, realm, user);
         if (token == null || token.isBlank()) return out;
         try {
             var resp = SimpleHttp
@@ -274,12 +293,10 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         return out;
     }
 
-    // ---------- role collection / mutation ----------
+    // ---------- roles ----------
     private Set<RoleModel> allRolesInRealm(RealmModel realm) {
         Set<RoleModel> all = new LinkedHashSet<>();
-        // realm roles
         realm.getRolesStream().forEach(all::add);
-        // client roles
         List<ClientModel> clients = realm.getClientsStream().collect(Collectors.toList());
         int clientCount = 0, clientRoleCount = 0;
         for (ClientModel c : clients) {
@@ -289,8 +306,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             clientRoleCount += (all.size() - before);
         }
         LOG.infof("Role inventory for realm=%s → realmRoles=%d clients=%d clientRoles=%d total=%d",
-                realm.getName(),
-                realm.getRolesStream().count(), clientCount, clientRoleCount, all.size());
+                realm.getName(), realm.getRolesStream().count(), clientCount, clientRoleCount, all.size());
         return all;
     }
 
@@ -304,7 +320,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             }
         }
         if (granted == 0) {
-            LOG.infof("No new roles to grant for %s (already had target set).", user.getUsername());
+            LOG.infof("No new roles to grant for %s.", user.getUsername());
         } else {
             LOG.infof("Total newly granted roles to %s: %d", user.getUsername(), granted);
         }
@@ -336,34 +352,21 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         }
     }
 
-    // ---------- role mapping / excludes ----------
+    // ---------- mapping/excludes ----------
     private static final class RoleSpec {
-        final boolean realm;
-        final String clientId; // when !realm
-        final String role;
-        RoleSpec(boolean realm, String clientId, String role) {
-            this.realm = realm; this.clientId = clientId; this.role = role;
-        }
+        final boolean realm; final String clientId; final String role;
+        RoleSpec(boolean realm, String clientId, String role) { this.realm = realm; this.clientId = clientId; this.role = role; }
         static RoleSpec realm(String role) { return new RoleSpec(true, null, role); }
         static RoleSpec client(String clientId, String role) { return new RoleSpec(false, clientId, role); }
     }
-
-    private static String specString(RoleSpec s) {
-        if (s == null) return "null";
-        return s.realm ? "realm:" + s.role : ("client:" + s.clientId + ":" + s.role);
-        }
+    private static String specString(RoleSpec s) { return s == null ? "null" : (s.realm ? "realm:" + s.role : "client:" + s.clientId + ":" + s.role); }
 
     private static RoleSpec parseRoleSpec(String spec) {
         if (spec == null || spec.isBlank()) return null;
         String[] parts = spec.split(":", 3);
-        if (parts.length >= 2 && "realm".equalsIgnoreCase(parts[0])) {
-            return RoleSpec.realm(parts[1]);
-        }
-        if (parts.length == 3 && "client".equalsIgnoreCase(parts[0])) {
-            return RoleSpec.client(parts[1], parts[2]);
-        }
-        // bare -> realm role
-        if (parts.length == 1) return RoleSpec.realm(parts[0]);
+        if (parts.length >= 2 && "realm".equalsIgnoreCase(parts[0])) return RoleSpec.realm(parts[1]);
+        if (parts.length == 3 && "client".equalsIgnoreCase(parts[0])) return RoleSpec.client(parts[1], parts[2]);
+        if (parts.length == 1) return RoleSpec.realm(parts[0]); // bare -> realm
         return null;
     }
 
@@ -425,19 +428,8 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
 
     // ---------- utils ----------
     private static String safe(String s) { return (s == null || s.isBlank()) ? "(blank)" : s; }
-
-    private static String truncate(String s, int max) {
-        if (s == null) return "";
-        return s.length() <= max ? s : s.substring(0, max) + "…";
-    }
-
-    private static JsonNode parseJsonQuiet(String body) {
-        try {
-            return org.keycloak.util.JsonSerialization.mapper.readTree(body);
-        } catch (Exception e) {
-            return null;
-        }
-    }
+    private static String truncate(String s, int max) { if (s == null) return ""; return s.length() <= max ? s : s.substring(0, max) + "…"; }
+    private static JsonNode parseJsonQuiet(String body) { try { return org.keycloak.util.JsonSerialization.mapper.readTree(body); } catch (Exception e) { return null; } }
 
     // ---------- Authenticator plumbing ----------
     @Override public void action(AuthenticationFlowContext ctx) { }
