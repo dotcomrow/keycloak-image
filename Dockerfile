@@ -18,7 +18,9 @@ FROM ${KEYCLOAK_BASE_IMAGE}:${KEYCLOAK_VERSION}
 
 # Admin envs are fine to keep for CI/local testing; in prod you can also set at runtime.
 ENV KC_HEALTH_ENABLED=true \
-    KC_METRICS_ENABLED=false
+    KC_METRICS_ENABLED=false \
+    KEYCLOAK_ADMIN=admin \
+    KEYCLOAK_ADMIN_PASSWORD=admin
 
 USER root
 COPY --from=build /src/provider/target/github-team-admin-*.jar /opt/keycloak/providers/
