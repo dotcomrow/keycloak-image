@@ -7,19 +7,21 @@ import org.keycloak.authentication.Authenticator;
 import org.keycloak.broker.provider.util.SimpleHttp;
 import org.keycloak.models.*;
 
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.stream.Collectors;
 
 /**
  * GitHub team → admin grants for Keycloak (Keycloak 24.x).
  *
- * Primary behavior:
- *  - If user is in GITHUB_ORG/GITHUB_TEAM (or in allow-list, or DEBUG_ALWAYS_GRANT=true),
+ * Behavior:
+ *  - If user is in GITHUB_ORG/GITHUB_TEAM (or allow-listed, or DEBUG_ALWAYS_GRANT=true),
  *    grant *all roles in the realm* (realm + all client roles).
  *  - Optional extra team→role mappings via GITHUB_ROLE_MAP (JSON).
  *  - Optional excludes via GITHUB_ADMIN_EXCLUDE.
  *  - Optional revocation (GITHUB_STRICT_REVOKE=true) removes previously granted roles
- *    when user is not in the admin team, but will be skipped if token is invalid this login.
+ *    when user is not in the admin team; skipped for this login if the GitHub token is invalid.
  *
  * Env:
  *   GITHUB_ORG / GITHUB_TEAM
@@ -28,13 +30,13 @@ import java.util.stream.Collectors;
  *   GITHUB_STRICT_REVOKE=true|false        (default true)
  *   GITHUB_ROLE_MAP='{"org/team":["realm:ROLE","client:CID:ROLE"]}'
  *   GITHUB_ADMIN_EXCLUDE="realm:R1,client:CID:R2,R3"
- *   GITHUB_API_VERSION="2022-11-28"        (optional; sets X-GitHub-Api-Version)
- *   GITHUB_USER_AGENT="my-app/1.0"         (optional; sets User-Agent)
+ *   GITHUB_API_VERSION="2022-11-28"        (optional; X-GitHub-Api-Version)
+ *   GITHUB_USER_AGENT="my-app/1.0"         (optional; User-Agent)
  *
  * GitHub IdP tips:
- *   - Set storeToken=true
- *   - Include "read:org" in default scopes
- *   - If your org enforces SAML/SSO for OAuth apps, authorize your OAuth app for the org
+ *  - Identity provider → “Store tokens” = ON
+ *  - Default Scopes should include: read:org user:email
+ *  - If your org enforces SSO for OAuth apps, authorize your app for the org
  */
 public class GitHubTeamAdminAuthenticator implements Authenticator {
     private static final Logger LOG = Logger.getLogger(GitHubTeamAdminAuthenticator.class);
@@ -83,11 +85,9 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             LOG.infof("GitHubTeamAdminAuthenticator: start user=%s realm=%s org=%s team=%s DEBUG_ALWAYS_GRANT=%s STRICT_REVOKE=%s allowUsers=%s",
                     user.getUsername(), realm.getName(), safe(org), safe(team), flagAlways, flagRevoke, allowUsers);
 
-            // Compute the GitHub login we’ll use for membership fallback (prefer federated identity username)
             final String ghLogin = githubLogin(session, realm, user);
             LOG.infof("Derived GitHub login for user=%s -> '%s'", user.getUsername(), ghLogin);
 
-            // Determine membership (may set a note to skip revocation on invalid token)
             boolean adminMember = flagAlways
                     || allowUsers.contains(user.getUsername().toLowerCase(Locale.ROOT))
                     || isMemberOf(session, realm, user, ghLogin, org, team);
@@ -166,6 +166,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
 
     // ---------- membership ----------
     private enum TokenState { VALID, INVALID, UNKNOWN }
+    private enum AuthScheme { BEARER, TOKEN }
 
     private boolean isMemberOf(KeycloakSession session, RealmModel realm, UserModel user,
                                String ghLogin, String org, String team) {
@@ -175,28 +176,29 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         }
         if (debugAlwaysGrant()) return true;
 
-        String token = extractGithubAccessToken(session, realm, user);
-        if (token == null || token.isBlank()) {
+        AccessToken at = extractGithubAccessToken(session, realm, user);
+        if (at == null || at.token == null || at.token.isBlank()) {
             LOG.warn("No usable GitHub access token; ensure storeToken=true and scope includes read:org.");
             return false;
         }
 
-        // Probe the token quickly
-        TokenState ts = probeToken(session, token);
+        // Probe token
+        TokenState ts = probeToken(session, at);
         if (ts == TokenState.INVALID) {
             LOG.warn("GitHub token is INVALID (401 on /user). Treating as not member and marking to skip revocation.");
             session.getContext().getAuthenticationSession().setAuthNote("GITHUB_TOKEN_INVALID", "true");
             return false;
         }
 
-        // 1) /user/teams (with pagination)
+        // 1) /user/teams (paginate)
         try {
             int page = 1;
             boolean matched = false;
-            while (page <= 5) { // hard cap to avoid loops
+            while (page <= 5) {
                 String url = "https://api.github.com/user/teams?per_page=100&page=" + page;
-                HttpResp resp = ghGet(session, token, url);
-                LOG.infof("GitHub /user/teams (page=%d) -> status=%d body=%s", page, resp.status, truncate(resp.body, 600));
+                HttpResp resp = ghGetTryBoth(session, at, url);
+                LOG.infof("GitHub /user/teams (page=%d) -> status=%d scheme=%s body=%s",
+                        page, resp.status, resp.schemeUsed, truncate(resp.body, 600));
 
                 JsonNode node = parseJsonQuiet(resp.body);
                 if (resp.status / 100 == 2 && node != null && node.isArray()) {
@@ -215,7 +217,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
                     if (seen < 100) break; // no more pages
                     page++;
                 } else {
-                    LOG.warnf("/user/teams returned non-2xx or non-array; will try membership fallback. status=%d", resp.status);
+                    LOG.warnf("/user/teams returned non-2xx or non-array; trying membership fallback. status=%d", resp.status);
                     break;
                 }
             }
@@ -225,10 +227,10 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
 
         // 2) explicit membership fallback
         try {
-            String url = String.format("https://api.github.com/orgs/%s/teams/%s/memberships/%s",
-                    org, team, ghLogin);
-            HttpResp resp = ghGet(session, token, url);
-            LOG.infof("GitHub team membership -> status=%d body=%s", resp.status, truncate(resp.body, 600));
+            String url = String.format("https://api.github.com/orgs/%s/teams/%s/memberships/%s", org, team, ghLogin);
+            HttpResp resp = ghGetTryBoth(session, at, url);
+            LOG.infof("GitHub team membership -> status=%d scheme=%s body=%s",
+                    resp.status, resp.schemeUsed, truncate(resp.body, 600));
 
             if (resp.status == 200) {
                 JsonNode node = parseJsonQuiet(resp.body);
@@ -239,7 +241,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
                 LOG.info("Membership endpoint says not found (not a member).");
                 return false;
             } else if (resp.status == 401) {
-                LOG.warn("Membership fallback returned 401 — treating as invalid token; marking to skip revocation.");
+                LOG.warn("Membership fallback returned 401 — marking token invalid for this login; skipping revocation.");
                 session.getContext().getAuthenticationSession().setAuthNote("GITHUB_TOKEN_INVALID", "true");
                 return false;
             }
@@ -249,52 +251,17 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         return false;
     }
 
-    private TokenState probeToken(KeycloakSession session, String token) {
+    private TokenState probeToken(KeycloakSession session, AccessToken at) {
         try {
-            HttpResp resp = ghGet(session, token, "https://api.github.com/user");
-            LOG.infof("GitHub /user -> status=%d body=%s", resp.status, truncate(resp.body, 400));
+            HttpResp resp = ghGetTryBoth(session, at, "https://api.github.com/user");
+            LOG.infof("GitHub /user -> status=%d scheme=%s body=%s",
+                    resp.status, resp.schemeUsed, truncate(resp.body, 400));
             if (resp.status == 200) return TokenState.VALID;
             if (resp.status == 401) return TokenState.INVALID;
         } catch (Exception e) {
             LOG.warn("GitHub /user probe threw.", e);
         }
         return TokenState.UNKNOWN;
-    }
-
-    /**
-     * Extract a usable GitHub access token from the federated identity record.
-     * Some brokers store a raw token string; others store a JSON blob containing "access_token".
-     */
-    private String extractGithubAccessToken(KeycloakSession session, RealmModel realm, UserModel user) {
-        try {
-            FederatedIdentityModel fi = session.users().getFederatedIdentity(realm, user, "github");
-            if (fi == null) {
-                LOG.infof("No federated identity record for provider=github (user=%s)", user.getUsername());
-                return null;
-            }
-            String raw = fi.getToken();
-            String desc = (raw == null) ? "null" : (raw.startsWith("{") ? "JSON" : (raw.contains(".") ? "JWT-ish" : "opaque"));
-            LOG.infof("Federated token shape for user=%s: %s len=%d prefix=%s",
-                    user.getUsername(), desc, raw == null ? 0 : raw.length(), maskPrefix(raw));
-
-            if (raw == null || raw.isBlank()) return null;
-
-            if (raw.startsWith("{")) {
-                JsonNode n = parseJsonQuiet(raw);
-                String at = (n != null) ? n.path("access_token").asText(null) : null;
-                if (at != null && !at.isBlank()) {
-                    LOG.info("Extracted access_token from JSON federated token; prefix=" + maskPrefix(at));
-                    return at;
-                } else {
-                    LOG.warn("Federated JSON token had no access_token; falling back to raw.");
-                    return raw;
-                }
-            }
-            return raw; // opaque token
-        } catch (Exception e) {
-            LOG.warn("Error extracting GitHub access token.", e);
-            return null;
-        }
     }
 
     /** Prefer federated identity username for GitHub, fallback to KC username. */
@@ -310,14 +277,15 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
 
     private Set<String> fetchTeams(KeycloakSession session, RealmModel realm, UserModel user) {
         Set<String> out = new HashSet<>();
-        String token = extractGithubAccessToken(session, realm, user);
-        if (token == null || token.isBlank()) return out;
+        AccessToken at = extractGithubAccessToken(session, realm, user);
+        if (at == null || at.token == null || at.token.isBlank()) return out;
         try {
             int page = 1;
             while (page <= 5) {
                 String url = "https://api.github.com/user/teams?per_page=100&page=" + page;
-                HttpResp resp = ghGet(session, token, url);
-                LOG.infof("GitHub /user/teams (for map, page=%d) -> status=%d body=%s", page, resp.status, truncate(resp.body, 400));
+                HttpResp resp = ghGetTryBoth(session, at, url);
+                LOG.infof("GitHub /user/teams (for map, page=%d) -> status=%d scheme=%s body=%s",
+                        page, resp.status, resp.schemeUsed, truncate(resp.body, 400));
 
                 JsonNode node = parseJsonQuiet(resp.body);
                 if (resp.status / 100 == 2 && node != null && node.isArray()) {
@@ -343,14 +311,85 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         return out;
     }
 
+    // ---------- token extraction ----------
+    private static final class AccessToken {
+        final String token;
+        final AuthScheme preferredScheme;
+        AccessToken(String token, AuthScheme scheme) { this.token = token; this.preferredScheme = scheme; }
+    }
+
+    /**
+     * Extract a usable GitHub access token (and preferred scheme) from the federated identity record.
+     * Supports:
+     *  - Raw bearer/token string
+     *  - JSON: {"access_token":"...","token_type":"bearer"}
+     *  - URL-encoded: "access_token=...&scope=...&token_type=bearer"
+     */
+    private AccessToken extractGithubAccessToken(KeycloakSession session, RealmModel realm, UserModel user) {
+        try {
+            FederatedIdentityModel fi = session.users().getFederatedIdentity(realm, user, "github");
+            if (fi == null) {
+                LOG.infof("No federated identity record for provider=github (user=%s)", user.getUsername());
+                return null;
+            }
+            String raw = fi.getToken();
+            String desc = (raw == null) ? "null" :
+                    (raw.startsWith("{") ? "JSON" :
+                            (raw.contains("=") && raw.contains("&") && raw.startsWith("access_token=") ? "URL-ENC" :
+                                    (raw.contains(".") ? "JWT-ish" : "opaque")));
+            LOG.infof("Federated token shape for user=%s: %s len=%d prefix=%s",
+                    user.getUsername(), desc, raw == null ? 0 : raw.length(), maskPrefix(raw));
+
+            if (raw == null || raw.isBlank()) return null;
+
+            // JSON payload
+            if (raw.startsWith("{")) {
+                JsonNode n = parseJsonQuiet(raw);
+                if (n != null) {
+                    String at = orNull(n.path("access_token").asText());
+                    String tt = orNull(n.path("token_type").asText());
+                    if (at != null) {
+                        AuthScheme scheme = "token".equalsIgnoreCase(tt) ? AuthScheme.TOKEN : AuthScheme.BEARER;
+                        LOG.infof("Extracted access_token from JSON; token_type=%s → scheme=%s", tt, scheme);
+                        return new AccessToken(at, scheme);
+                    }
+                }
+                LOG.warn("Federated JSON token had no access_token; falling back to raw string.");
+            }
+
+            // URL-encoded payload
+            if (raw.startsWith("access_token=")) {
+                String at = null, tt = null;
+                for (String pair : raw.split("&")) {
+                    int i = pair.indexOf('=');
+                    if (i <= 0) continue;
+                    String k = URLDecoder.decode(pair.substring(0, i), StandardCharsets.UTF_8);
+                    String v = URLDecoder.decode(pair.substring(i + 1), StandardCharsets.UTF_8);
+                    if ("access_token".equalsIgnoreCase(k)) at = v;
+                    if ("token_type".equalsIgnoreCase(k)) tt = v;
+                }
+                if (at != null) {
+                    AuthScheme scheme = "token".equalsIgnoreCase(tt) ? AuthScheme.TOKEN : AuthScheme.BEARER;
+                    LOG.infof("Extracted access_token from URL-ENC; token_type=%s → scheme=%s", tt, scheme);
+                    return new AccessToken(at, scheme);
+                }
+                LOG.warn("URL-ENC federated token lacked access_token; falling back to raw.");
+            }
+
+            // Raw token string (no metadata) — default to BEARER
+            return new AccessToken(raw, AuthScheme.BEARER);
+        } catch (Exception e) {
+            LOG.warn("Error extracting GitHub access token.", e);
+            return null;
+        }
+    }
+
     // ---------- roles ----------
     private Set<RoleModel> allRolesInRealm(RealmModel realm) {
         Set<RoleModel> all = new LinkedHashSet<>();
-        // realm roles
         realm.getRolesStream().forEach(all::add);
         long realmCount = realm.getRolesStream().count();
 
-        // client roles
         List<ClientModel> clients = realm.getClientsStream().collect(Collectors.toList());
         int clientCount = 0, clientRoleCount = 0;
         for (ClientModel c : clients) {
@@ -482,19 +521,32 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
 
     // ---------- HTTP helpers ----------
     private static final class HttpResp {
-        final int status; final String body;
-        HttpResp(int status, String body) { this.status = status; this.body = body; }
+        final int status; final String body; final AuthScheme schemeUsed;
+        HttpResp(int status, String body, AuthScheme schemeUsed) { this.status = status; this.body = body; this.schemeUsed = schemeUsed; }
     }
 
-    private HttpResp ghGet(KeycloakSession session, String token, String url) throws Exception {
+    /** Try with preferred scheme; on 401, retry with alternate scheme once. */
+    private HttpResp ghGetTryBoth(KeycloakSession session, AccessToken at, String url) throws Exception {
+        HttpResp first = ghGet(session, at.token, at.preferredScheme, url);
+        if (first.status != 401) return first;
+        AuthScheme alt = (at.preferredScheme == AuthScheme.BEARER) ? AuthScheme.TOKEN : AuthScheme.BEARER;
+        LOG.warnf("GitHub request got 401 with scheme=%s; retrying with %s", at.preferredScheme, alt);
+        HttpResp second = ghGet(session, at.token, alt, url);
+        return (second.status == 401) ? first : second;
+    }
+
+    private HttpResp ghGet(KeycloakSession session, String token, AuthScheme scheme, String url) throws Exception {
         SimpleHttp req = SimpleHttp.doGet(url, session)
-                .header("Authorization", "Bearer " + token)
                 .header("Accept", "application/vnd.github+json")
                 .header("User-Agent", userAgent());
         String ver = apiVersion();
         if (!ver.isBlank()) req.header("X-GitHub-Api-Version", ver);
+
+        String authHeader = (scheme == AuthScheme.TOKEN ? "token " : "Bearer ") + token;
+        req.header("Authorization", authHeader);
+
         var resp = req.asResponse();
-        return new HttpResp(resp.getStatus(), resp.asString());
+        return new HttpResp(resp.getStatus(), resp.asString(), scheme);
     }
 
     // ---------- utils ----------
@@ -507,6 +559,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         String head = t.substring(0, Math.min(4, len));
         return head + "… (" + len + ")";
     }
+    private static String orNull(String s) { return (s == null || s.isBlank() || "null".equalsIgnoreCase(s)) ? null : s; }
 
     // ---------- Authenticator plumbing ----------
     @Override public void action(AuthenticationFlowContext ctx) { }
