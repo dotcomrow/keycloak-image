@@ -11,28 +11,30 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * GitHub team → admin grants for Keycloak.
+ * GitHub team → admin grants for Keycloak (Keycloak 24.x).
  *
  * Primary behavior:
- *  - If user is in GITHUB_ORG/GITHUB_TEAM (or allow-listed or DEBUG_ALWAYS_GRANT=true),
- *    grant *all roles in the realm* (realm + every client role).
+ *  - If user is in GITHUB_ORG/GITHUB_TEAM (or in allow-list, or DEBUG_ALWAYS_GRANT=true),
+ *    grant *all roles in the realm* (realm + all client roles).
  *  - Optional extra team→role mappings via GITHUB_ROLE_MAP (JSON).
  *  - Optional excludes via GITHUB_ADMIN_EXCLUDE.
  *  - Optional revocation (GITHUB_STRICT_REVOKE=true) removes previously granted roles
- *    when user is not in the admin team.
+ *    when user is not in the admin team, but will be skipped if token is invalid this login.
  *
  * Env:
  *   GITHUB_ORG / GITHUB_TEAM
  *   DEBUG_ALWAYS_GRANT=true|false
- *   GITHUB_ADMIN_USERNAMES="a,b,c"
- *   GITHUB_STRICT_REVOKE=true|false (default true)
+ *   GITHUB_ADMIN_USERNAMES="a,b,c"         (optional allow-list, case-insensitive)
+ *   GITHUB_STRICT_REVOKE=true|false        (default true)
  *   GITHUB_ROLE_MAP='{"org/team":["realm:ROLE","client:CID:ROLE"]}'
  *   GITHUB_ADMIN_EXCLUDE="realm:R1,client:CID:R2,R3"
+ *   GITHUB_API_VERSION="2022-11-28"        (optional; sets X-GitHub-Api-Version)
+ *   GITHUB_USER_AGENT="my-app/1.0"         (optional; sets User-Agent)
  *
  * GitHub IdP tips:
  *   - Set storeToken=true
  *   - Include "read:org" in default scopes
- *   - If your org enforces SAML/SSO, authorize your OAuth app/token for the org
+ *   - If your org enforces SAML/SSO for OAuth apps, authorize your OAuth app for the org
  */
 public class GitHubTeamAdminAuthenticator implements Authenticator {
     private static final Logger LOG = Logger.getLogger(GitHubTeamAdminAuthenticator.class);
@@ -43,12 +45,16 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         String v = getenv(k, def ? "true" : "false");
         return "true".equalsIgnoreCase(v) || "1".equals(v);
     }
+
     private static String adminOrg()  { return getenv("GITHUB_ORG", getenv("GITHUB_ADMIN_ORG", "")).trim(); }
     private static String adminTeam() { return getenv("GITHUB_TEAM", getenv("GITHUB_ADMIN_TEAM", "")).trim(); }
     private static boolean debugAlwaysGrant() { return isTrue("DEBUG_ALWAYS_GRANT", false); }
     private static boolean strictRevoke()     { return isTrue("GITHUB_STRICT_REVOKE", true); }
     private static String roleMapJson()       { return getenv("GITHUB_ROLE_MAP", "").trim(); }
     private static String excludeCsv()        { return getenv("GITHUB_ADMIN_EXCLUDE", "").trim(); }
+    private static String apiVersion()        { return getenv("GITHUB_API_VERSION", "").trim(); }
+    private static String userAgent()         { return getenv("GITHUB_USER_AGENT", "keycloak-github-admin/1.0"); }
+
     private static Set<String> adminUsernames() {
         String csv = getenv("GITHUB_ADMIN_USERNAMES", "").trim();
         if (csv.isEmpty()) return Collections.emptySet();
@@ -77,9 +83,14 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             LOG.infof("GitHubTeamAdminAuthenticator: start user=%s realm=%s org=%s team=%s DEBUG_ALWAYS_GRANT=%s STRICT_REVOKE=%s allowUsers=%s",
                     user.getUsername(), realm.getName(), safe(org), safe(team), flagAlways, flagRevoke, allowUsers);
 
+            // Compute the GitHub login we’ll use for membership fallback (prefer federated identity username)
+            final String ghLogin = githubLogin(session, realm, user);
+            LOG.infof("Derived GitHub login for user=%s -> '%s'", user.getUsername(), ghLogin);
+
+            // Determine membership (may set a note to skip revocation on invalid token)
             boolean adminMember = flagAlways
                     || allowUsers.contains(user.getUsername().toLowerCase(Locale.ROOT))
-                    || isMemberOf(session, realm, user, org, team);
+                    || isMemberOf(session, realm, user, ghLogin, org, team);
 
             LOG.infof("Admin membership decision for user=%s → %s", user.getUsername(), adminMember ? "GRANT" : "NO-GRANT");
 
@@ -94,7 +105,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             // Optional extra maps
             Map<String, List<RoleSpec>> map = parseRoleMap(roleMapJson());
             if (!map.isEmpty()) {
-                Set<String> myTeams = fetchTeams(session, realm, user); // "org/team"
+                Set<String> myTeams = fetchTeams(session, realm, user);
                 LOG.infof("Extra role map: user teams=%s", myTeams);
                 for (String key : myTeams) {
                     List<RoleSpec> wants = map.get(key);
@@ -126,8 +137,11 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
                 LOG.infof("No target roles to grant for user=%s", user.getUsername());
             }
 
-            // Revoke (only when NOT admin)
-            if (!adminMember && flagRevoke) {
+            // Revoke (only when NOT admin) — but skip if token invalid this turn
+            boolean tokenInvalidThisTurn = "true".equals(
+                    session.getContext().getAuthenticationSession().getAuthNote("GITHUB_TOKEN_INVALID"));
+
+            if (!adminMember && flagRevoke && !tokenInvalidThisTurn) {
                 Set<RoleModel> grantable = new LinkedHashSet<>(allRolesInRealm(realm));
                 for (List<RoleSpec> specs : map.values()) {
                     for (RoleSpec s : specs) {
@@ -138,6 +152,8 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
                 if (!excludes.isEmpty()) grantable.removeIf(r -> excludeMatch(r, excludes));
                 LOG.infof("Revocation pass: considering %d role(s).", grantable.size());
                 revokeIfPresent(user, grantable);
+            } else if (tokenInvalidThisTurn) {
+                LOG.warn("Skipping revocation because GitHub token was INVALID (401) in this login.");
             }
 
             ctx.success();
@@ -149,7 +165,10 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
     }
 
     // ---------- membership ----------
-    private boolean isMemberOf(KeycloakSession session, RealmModel realm, UserModel user, String org, String team) {
+    private enum TokenState { VALID, INVALID, UNKNOWN }
+
+    private boolean isMemberOf(KeycloakSession session, RealmModel realm, UserModel user,
+                               String ghLogin, String org, String team) {
         if (org.isBlank() || team.isBlank()) {
             LOG.warn("GITHUB_ORG or GITHUB_TEAM is blank; cannot determine membership.");
             return false;
@@ -162,64 +181,84 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             return false;
         }
 
-        // 1) /user/teams
+        // Probe the token quickly
+        TokenState ts = probeToken(session, token);
+        if (ts == TokenState.INVALID) {
+            LOG.warn("GitHub token is INVALID (401 on /user). Treating as not member and marking to skip revocation.");
+            session.getContext().getAuthenticationSession().setAuthNote("GITHUB_TOKEN_INVALID", "true");
+            return false;
+        }
+
+        // 1) /user/teams (with pagination)
         try {
-            var resp = SimpleHttp
-                    .doGet("https://api.github.com/user/teams", session)
-                    .header("Authorization", "Bearer " + token)
-                    .header("Accept", "application/vnd.github+json")
-                    .param("per_page", "100")
-                    .asResponse();
+            int page = 1;
+            boolean matched = false;
+            while (page <= 5) { // hard cap to avoid loops
+                String url = "https://api.github.com/user/teams?per_page=100&page=" + page;
+                HttpResp resp = ghGet(session, token, url);
+                LOG.infof("GitHub /user/teams (page=%d) -> status=%d body=%s", page, resp.status, truncate(resp.body, 600));
 
-            int sc = resp.getStatus();
-            String body = resp.asString();
-            LOG.infof("GitHub /user/teams -> status=%d body=%s", sc, truncate(body, 500));
-
-            JsonNode node = parseJsonQuiet(body);
-            if (sc / 100 == 2 && node != null && node.isArray()) {
-                for (var it = node.elements(); it.hasNext();) {
-                    JsonNode t = it.next();
-                    String slug = t.path("slug").asText("");
-                    String orgLogin = t.path("organization").path("login").asText("");
-                    LOG.debugf("Team seen: %s/%s", orgLogin, slug);
-                    if (team.equalsIgnoreCase(slug) && org.equalsIgnoreCase(orgLogin)) {
-                        LOG.infof("Matched admin team via /user/teams: %s/%s", org, team);
-                        return true;
+                JsonNode node = parseJsonQuiet(resp.body);
+                if (resp.status / 100 == 2 && node != null && node.isArray()) {
+                    int seen = 0;
+                    for (var it = node.elements(); it.hasNext();) {
+                        JsonNode t = it.next(); seen++;
+                        String slug = t.path("slug").asText("");
+                        String orgLogin = t.path("organization").path("login").asText("");
+                        LOG.debugf("Team seen: %s/%s", orgLogin, slug);
+                        if (team.equalsIgnoreCase(slug) && org.equalsIgnoreCase(orgLogin)) {
+                            LOG.infof("Matched admin team via /user/teams: %s/%s", org, team);
+                            matched = true; break;
+                        }
                     }
+                    if (matched) return true;
+                    if (seen < 100) break; // no more pages
+                    page++;
+                } else {
+                    LOG.warnf("/user/teams returned non-2xx or non-array; will try membership fallback. status=%d", resp.status);
+                    break;
                 }
-            } else {
-                LOG.warnf("GitHub /user/teams returned non-array or error; will try membership fallback.");
             }
         } catch (Exception e) {
-            LOG.warn("GitHub /user/teams threw; will try membership fallback.", e);
+            LOG.warn("/user/teams threw; will try membership fallback.", e);
         }
 
         // 2) explicit membership fallback
         try {
             String url = String.format("https://api.github.com/orgs/%s/teams/%s/memberships/%s",
-                    org, team, user.getUsername());
-            var resp = SimpleHttp.doGet(url, session)
-                    .header("Authorization", "Bearer " + token)
-                    .header("Accept", "application/vnd.github+json")
-                    .asResponse();
+                    org, team, ghLogin);
+            HttpResp resp = ghGet(session, token, url);
+            LOG.infof("GitHub team membership -> status=%d body=%s", resp.status, truncate(resp.body, 600));
 
-            int sc = resp.getStatus();
-            String body = resp.asString();
-            LOG.infof("GitHub team membership -> status=%d body=%s", sc, truncate(body, 500));
-
-            if (sc == 200) {
-                JsonNode node = parseJsonQuiet(body);
+            if (resp.status == 200) {
+                JsonNode node = parseJsonQuiet(resp.body);
                 String state = node != null ? node.path("state").asText("") : "";
-                LOG.infof("Membership state for %s/%s user=%s -> %s", org, team, user.getUsername(), state);
+                LOG.infof("Membership state for %s/%s user=%s -> %s", org, team, ghLogin, state);
                 return "active".equalsIgnoreCase(state);
-            } else if (sc == 404) {
+            } else if (resp.status == 404) {
                 LOG.info("Membership endpoint says not found (not a member).");
+                return false;
+            } else if (resp.status == 401) {
+                LOG.warn("Membership fallback returned 401 — treating as invalid token; marking to skip revocation.");
+                session.getContext().getAuthenticationSession().setAuthNote("GITHUB_TOKEN_INVALID", "true");
                 return false;
             }
         } catch (Exception e) {
             LOG.warn("GitHub membership fallback threw.", e);
         }
         return false;
+    }
+
+    private TokenState probeToken(KeycloakSession session, String token) {
+        try {
+            HttpResp resp = ghGet(session, token, "https://api.github.com/user");
+            LOG.infof("GitHub /user -> status=%d body=%s", resp.status, truncate(resp.body, 400));
+            if (resp.status == 200) return TokenState.VALID;
+            if (resp.status == 401) return TokenState.INVALID;
+        } catch (Exception e) {
+            LOG.warn("GitHub /user probe threw.", e);
+        }
+        return TokenState.UNKNOWN;
     }
 
     /**
@@ -235,28 +274,38 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             }
             String raw = fi.getToken();
             String desc = (raw == null) ? "null" : (raw.startsWith("{") ? "JSON" : (raw.contains(".") ? "JWT-ish" : "opaque"));
-            LOG.infof("Federated token shape for user=%s: %s (len=%d)", user.getUsername(), desc, raw == null ? 0 : raw.length());
+            LOG.infof("Federated token shape for user=%s: %s len=%d prefix=%s",
+                    user.getUsername(), desc, raw == null ? 0 : raw.length(), maskPrefix(raw));
 
             if (raw == null || raw.isBlank()) return null;
 
             if (raw.startsWith("{")) {
-                // Likely a full token response; extract access_token
                 JsonNode n = parseJsonQuiet(raw);
                 String at = (n != null) ? n.path("access_token").asText(null) : null;
                 if (at != null && !at.isBlank()) {
-                    LOG.info("Extracted access_token from JSON federated token.");
+                    LOG.info("Extracted access_token from JSON federated token; prefix=" + maskPrefix(at));
                     return at;
                 } else {
                     LOG.warn("Federated JSON token had no access_token; falling back to raw.");
                     return raw;
                 }
             }
-            // Otherwise assume it's an opaque bearer token already
-            return raw;
+            return raw; // opaque token
         } catch (Exception e) {
             LOG.warn("Error extracting GitHub access token.", e);
             return null;
         }
+    }
+
+    /** Prefer federated identity username for GitHub, fallback to KC username. */
+    private String githubLogin(KeycloakSession session, RealmModel realm, UserModel user) {
+        try {
+            FederatedIdentityModel fi = session.users().getFederatedIdentity(realm, user, "github");
+            if (fi != null && fi.getUserName() != null && !fi.getUserName().isBlank()) {
+                return fi.getUserName();
+            }
+        } catch (Exception ignored) {}
+        return user.getUsername();
     }
 
     private Set<String> fetchTeams(KeycloakSession session, RealmModel realm, UserModel user) {
@@ -264,26 +313,27 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         String token = extractGithubAccessToken(session, realm, user);
         if (token == null || token.isBlank()) return out;
         try {
-            var resp = SimpleHttp
-                    .doGet("https://api.github.com/user/teams", session)
-                    .header("Authorization", "Bearer " + token)
-                    .header("Accept", "application/vnd.github+json")
-                    .param("per_page", "100")
-                    .asResponse();
+            int page = 1;
+            while (page <= 5) {
+                String url = "https://api.github.com/user/teams?per_page=100&page=" + page;
+                HttpResp resp = ghGet(session, token, url);
+                LOG.infof("GitHub /user/teams (for map, page=%d) -> status=%d body=%s", page, resp.status, truncate(resp.body, 400));
 
-            int sc = resp.getStatus();
-            String body = resp.asString();
-            LOG.infof("GitHub /user/teams (for map) -> status=%d body=%s", sc, truncate(body, 400));
-
-            JsonNode node = parseJsonQuiet(body);
-            if (sc / 100 == 2 && node != null && node.isArray()) {
-                for (var it = node.elements(); it.hasNext();) {
-                    JsonNode t = it.next();
-                    String slug = t.path("slug").asText("");
-                    String orgLogin = t.path("organization").path("login").asText("");
-                    if (!slug.isBlank() && !orgLogin.isBlank()) {
-                        out.add((orgLogin + "/" + slug).toLowerCase(Locale.ROOT));
+                JsonNode node = parseJsonQuiet(resp.body);
+                if (resp.status / 100 == 2 && node != null && node.isArray()) {
+                    int seen = 0;
+                    for (var it = node.elements(); it.hasNext();) {
+                        JsonNode t = it.next(); seen++;
+                        String slug = t.path("slug").asText("");
+                        String orgLogin = t.path("organization").path("login").asText("");
+                        if (!slug.isBlank() && !orgLogin.isBlank()) {
+                            out.add((orgLogin + "/" + slug).toLowerCase(Locale.ROOT));
+                        }
                     }
+                    if (seen < 100) break;
+                    page++;
+                } else {
+                    break;
                 }
             }
             LOG.infof("Parsed %d team(s) for user=%s", out.size(), user.getUsername());
@@ -296,7 +346,11 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
     // ---------- roles ----------
     private Set<RoleModel> allRolesInRealm(RealmModel realm) {
         Set<RoleModel> all = new LinkedHashSet<>();
+        // realm roles
         realm.getRolesStream().forEach(all::add);
+        long realmCount = realm.getRolesStream().count();
+
+        // client roles
         List<ClientModel> clients = realm.getClientsStream().collect(Collectors.toList());
         int clientCount = 0, clientRoleCount = 0;
         for (ClientModel c : clients) {
@@ -306,7 +360,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             clientRoleCount += (all.size() - before);
         }
         LOG.infof("Role inventory for realm=%s → realmRoles=%d clients=%d clientRoles=%d total=%d",
-                realm.getName(), realm.getRolesStream().count(), clientCount, clientRoleCount, all.size());
+                realm.getName(), realmCount, clientCount, clientRoleCount, all.size());
         return all;
     }
 
@@ -426,10 +480,33 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         return (c != null) ? c.getRole(spec.role) : null;
     }
 
+    // ---------- HTTP helpers ----------
+    private static final class HttpResp {
+        final int status; final String body;
+        HttpResp(int status, String body) { this.status = status; this.body = body; }
+    }
+
+    private HttpResp ghGet(KeycloakSession session, String token, String url) throws Exception {
+        SimpleHttp req = SimpleHttp.doGet(url, session)
+                .header("Authorization", "Bearer " + token)
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", userAgent());
+        String ver = apiVersion();
+        if (!ver.isBlank()) req.header("X-GitHub-Api-Version", ver);
+        var resp = req.asResponse();
+        return new HttpResp(resp.getStatus(), resp.asString());
+    }
+
     // ---------- utils ----------
     private static String safe(String s) { return (s == null || s.isBlank()) ? "(blank)" : s; }
     private static String truncate(String s, int max) { if (s == null) return ""; return s.length() <= max ? s : s.substring(0, max) + "…"; }
     private static JsonNode parseJsonQuiet(String body) { try { return org.keycloak.util.JsonSerialization.mapper.readTree(body); } catch (Exception e) { return null; } }
+    private static String maskPrefix(String t) {
+        if (t == null || t.isBlank()) return "(none)";
+        int len = t.length();
+        String head = t.substring(0, Math.min(4, len));
+        return head + "… (" + len + ")";
+    }
 
     // ---------- Authenticator plumbing ----------
     @Override public void action(AuthenticationFlowContext ctx) { }
