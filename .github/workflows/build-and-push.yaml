@@ -47,21 +47,12 @@ jobs:
             type=raw,value=${{ env.KEYCLOAK_VERSION }}
             type=sha
 
-      - name: Log in to GHCR
-        if: ${{ github.event_name != 'pull_request' }}
-        id: registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build image (no push)
+      - name: Build (load locally for tests) — single build
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: false
-          load: true
+          push: false           # don't push here
+          load: true            # load to local Docker for tests
           build-args: |
             KEYCLOAK_VERSION=${{ env.KEYCLOAK_VERSION }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -112,7 +103,6 @@ jobs:
           set -euo pipefail
           echo "Listing /opt/keycloak/providers in container:"
           docker exec kc bash -lc 'ls -l /opt/keycloak/providers || true'
-          # Hard fail if no jar is present
           COUNT=$(docker exec kc bash -lc 'shopt -s nullglob; set -- /opt/keycloak/providers/*.jar; echo $#')
           if [ "$COUNT" -eq 0 ]; then
             echo "❌ No JARs found under /opt/keycloak/providers. Your Dockerfile may not be copying the artifact name you expect."
@@ -125,7 +115,7 @@ jobs:
           SERVER=http://localhost:8080
           REALM=master
           FLOW="GitHub-PostLogin"
-          PROVIDER_ID="github-team-admin"
+          PROVIDER_ID="${{ env.PROVIDER_ID }}"
 
           docker exec kc /opt/keycloak/bin/kcadm.sh config credentials \
             --server "$SERVER" --realm "$REALM" \
@@ -189,7 +179,6 @@ jobs:
 
           if [ -z "$ok" ]; then
             echo "Falling back to flow-level update endpoint..."
-            # Some KC versions require updating via flow alias endpoint
             cat > /tmp/req.json <<JSON
           { "id": "$EID", "requirement": "REQUIRED" }
           JSON
@@ -204,16 +193,25 @@ jobs:
                 END {exit (found?0:1)}'
           echo "✅ Provider present and REQUIRED under flow '$FLOW'."
 
-      - name: Push image
+      - name: Log in to GHCR (for push)
         if: ${{ github.event_name != 'pull_request' }}
-        uses: docker/build-push-action@v6
+        uses: docker/login-action@v3
         with:
-          context: .
-          push: true
-          build-args: |
-            KEYCLOAK_VERSION=${{ env.KEYCLOAK_VERSION }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push built image tags (no rebuild)
+        if: ${{ github.event_name != 'pull_request' }}
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          echo "Pushing tags:"
+          printf '%s\n' "$TAGS"
+          printf '%s\n' "$TAGS" | while read -r tag; do
+            [ -n "$tag" ] && docker push "$tag"
+          done
 
       - name: Teardown
         if: always()
