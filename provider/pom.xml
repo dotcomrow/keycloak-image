@@ -1,10 +1,10 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0"  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0  http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
-  <groupId>com.example.kc</groupId>
-  <artifactId>github-team-admin</artifactId>
+  <groupId>systems.suncoast.kc</groupId>
+  <artifactId>suncoast-systems-providers</artifactId>
   <version>1.0.0</version>
-  <name>Keycloak GitHub Team Admin Authenticator</name>
+  <name>Keycloak Suncoast Systems Providers</name>
 
   <properties>
     <maven.compiler.release>17</maven.compiler.release>

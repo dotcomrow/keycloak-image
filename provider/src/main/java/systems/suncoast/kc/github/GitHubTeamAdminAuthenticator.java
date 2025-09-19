@@ -1,4 +1,4 @@
-package com.example.kc.github;
+package systems.suncoast.kc.github;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import org.jboss.logging.Logger;

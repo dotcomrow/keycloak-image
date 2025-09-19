@@ -23,7 +23,7 @@ ENV KC_HEALTH_ENABLED=true \
     KEYCLOAK_ADMIN_PASSWORD=admin
 
 USER root
-COPY --from=build /src/provider/target/github-team-admin-*.jar /opt/keycloak/providers/
+COPY --from=build /src/provider/target/*.jar /opt/keycloak/providers/
 RUN mkdir -p /opt/keycloak/data \
  && chown -R 1000:0 /opt/keycloak \
  && chmod -R g+rw /opt/keycloak
