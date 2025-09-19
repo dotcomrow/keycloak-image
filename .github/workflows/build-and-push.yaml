@@ -191,7 +191,6 @@ jobs:
               echo "Falling back to flow-level update endpoint..."
               printf '{ "id": "%s", "requirement": "REQUIRED" }\n' "$EID" \
                 | docker exec -i kc /opt/keycloak/bin/kcadm.sh update "authentication/flows/$FLOW/executions" -r "$REALM" -f -
-              docker exec -i kc /opt/keycloak/bin/kcadm.sh update "authentication/flows/$FLOW/executions" -r "$REALM" -f - < /tmp/req.json
             fi
 
             echo "Verify requirement..."
