@@ -8,8 +8,6 @@ import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 
-import systems.suncoast.kc.github.GitHubTeamAdminAuthenticator;
-
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
