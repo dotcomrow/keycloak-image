@@ -9,7 +9,7 @@
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
     <!-- CI can override with -Dkeycloak.version=24.0.5 (for example) -->
-    <keycloak.version>24.0.5</keycloak.version>
+    <keycloak.version>26.4.1</keycloak.version>
   </properties>
 
   <dependencies>
