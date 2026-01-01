@@ -51,3 +51,35 @@ The authenticator **id** is: `github-team-admin`
 
 The sample implementation is a minimal pass-through authenticator so CI can prove
 load + attach mechanics. Extend it to call GitHub and grant roles as needed.
+
+## Google Groups Authenticator
+
+Provider **id**: `google-groups-authenticator`
+
+Fetches Cloud Identity / Google Workspace group membership at login using a
+service account with domain-wide delegation. It supports external users by
+checking membership against a configured list of groups.
+
+### Required env
+
+- `GOOGLE_ADMIN_EMAIL` (or `GOOGLE_DELEGATED_ADMIN`) — delegated admin to impersonate
+- `GOOGLE_SA_JSON_PATH` or `GOOGLE_SA_JSON` — service account JSON
+
+### Group selection and mapping
+
+- `GOOGLE_GROUPS` — CSV list of group emails to check
+- `GOOGLE_GROUP_ROLE_MAP` — JSON map of `group-email` → roles
+  - Example: `{"tier-pro@acme.com":["realm:tier_pro","client:public-app:feature_x"]}`
+- `GOOGLE_AUTO_ROLES` — `true|false` (default `true`) to auto-create `ggl:` roles per group
+- `GOOGLE_ROLE_PREFIX` — prefix for auto roles (default `ggl:`)
+
+### Behavior
+
+- `GOOGLE_STRICT_REVOKE` — `true|false` (default `true`) revoke managed roles if no longer in group
+- `GOOGLE_GROUPS_TTL_SECONDS` — cache TTL (default `600`)
+
+### Admin SDK scopes
+
+Ensure the service account is authorized for:
+- `https://www.googleapis.com/auth/admin.directory.group.readonly`
+- `https://www.googleapis.com/auth/admin.directory.group.member.readonly`

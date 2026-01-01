@@ -24,6 +24,7 @@ ENV KC_HEALTH_ENABLED=true \
 
 USER root
 COPY --from=build /src/provider/target/*.jar /opt/keycloak/providers/
+COPY --from=build /src/provider/target/deps/*.jar /opt/keycloak/providers/
 RUN mkdir -p /opt/keycloak/data \
  && chown -R 1000:0 /opt/keycloak \
  && chmod -R g+rw /opt/keycloak
