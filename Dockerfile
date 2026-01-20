@@ -31,7 +31,7 @@ RUN mkdir -p /opt/keycloak/data \
 USER 1000
 
 # Bake Postgres + scripts at build time
-RUN /opt/keycloak/bin/kc.sh build --db=postgres
+RUN /opt/keycloak/bin/kc.sh build --db=postgres --features=token-exchange
 
 # Start prebuilt server; relaxed hostname for CI
 ENTRYPOINT ["/opt/keycloak/bin/kc.sh","start","--optimized","--http-enabled=true","--hostname-strict=false"]
