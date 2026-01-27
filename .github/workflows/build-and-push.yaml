@@ -104,18 +104,19 @@ jobs:
       - name: Start Keycloak (under test)
         run: |
           set -euo pipefail
-          docker run -d --rm --name kc --network kc-net -p 8080:8080 \
+          docker run -d --rm --name kc --network kc-net -p 8080:8080 -p 9000:9000 \
             -e KC_DB=postgres \
             -e KC_DB_URL=jdbc:postgresql://kc-db:5432/keycloak \
             -e KC_DB_USERNAME=keycloak \
             -e KC_DB_PASSWORD=keycloak \
             -e KC_DB_SCHEMA=public \
+            -e KC_HEALTH_ENABLED=true \
             -e DEBUG_ALWAYS_GRANT=true \
             "$IMG"
           for i in {1..120}; do
-            curl -fsS http://localhost:8080/health/ready && break || sleep 2
+            curl -fsS http://localhost:9000/health/ready && break || sleep 2
           done
-          curl -fsS http://localhost:8080/health/ready
+          curl -fsS http://localhost:9000/health/ready
 
       - name: Verify provider jars present in container
         run: |
