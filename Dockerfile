@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 ARG KEYCLOAK_BASE_IMAGE=quay.io/keycloak/keycloak
-ARG KEYCLOAK_VERSION=24.0.5
+ARG KEYCLOAK_VERSION
 
 FROM maven:3.9-eclipse-temurin-17 AS build
 WORKDIR /src
@@ -31,7 +31,7 @@ RUN mkdir -p /opt/keycloak/data \
 USER 1000
 
 # Bake Postgres + scripts at build time
-RUN /opt/keycloak/bin/kc.sh build --db=postgres --features=token-exchange
+RUN /opt/keycloak/bin/kc.sh build --db=postgres --features=token-exchange,admin-fine-grained-authz
 
 # Start prebuilt server; relaxed hostname for CI
 ENTRYPOINT ["/opt/keycloak/bin/kc.sh","start","--optimized","--http-enabled=true","--hostname-strict=false"]

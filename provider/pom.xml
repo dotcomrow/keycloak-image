@@ -8,8 +8,7 @@
 
   <properties>
     <maven.compiler.release>17</maven.compiler.release>
-    <!-- CI can override with -Dkeycloak.version=24.0.5 (for example) -->
-    <keycloak.version>24.0.5</keycloak.version>
+    <!-- Set via -Dkeycloak.version (GitHub Actions passes KEYCLOAK_VERSION through the Docker build). -->
     <google.auth.version>1.24.0</google.auth.version>
   </properties>
 

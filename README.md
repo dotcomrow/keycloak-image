@@ -6,8 +6,8 @@ CI proves the provider loads and can be attached to a flow via `kcadm.sh` **befo
 ## Quick start (locally)
 
 ```bash
-# build the image locally (uses default KEYCLOAK_VERSION=24.0.5)
-docker build -t keycloak/github-team-admin:dev .
+# build the image locally (KEYCLOAK_VERSION is required)
+docker build --build-arg KEYCLOAK_VERSION=26.5.1 -t keycloak/github-team-admin:dev .
 
 # run with a local Postgres
 docker network create kc-net || true
@@ -30,7 +30,7 @@ curl -fsS http://localhost:8080/health/ready
 ### Tags produced (on `main`)
 
 - `latest`
-- `${KEYCLOAK_VERSION}` (e.g. `24.0.5`)
+- `${KEYCLOAK_VERSION}` (e.g. `26.5.1`)
 - `${KEYCLOAK_VERSION}-sha-${{ github.sha }}`
 - `sha-${{ github.sha }}` (from metadata-action)
 - `${{ inputs.image_version }}` if provided via **workflow_dispatch** input (e.g. `1.0.3`)
