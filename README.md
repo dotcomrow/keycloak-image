@@ -9,7 +9,7 @@ CI proves the provider loads and can be attached to a flow via `kcadm.sh` **befo
 # build the image locally (build-time args are required)
 docker build \
   --build-arg KEYCLOAK_VERSION=26.5.1 \
-  --build-arg KC_FEATURES=token-exchange \
+  --build-arg KC_FEATURES=token-exchange-standard-v2,token-exchange-external-internal-v2 \
   --build-arg KC_HTTP_RELATIVE_PATH=/ \
   --build-arg KC_TRANSACTION_XA_ENABLED=false \
   -t keycloak/github-team-admin:dev .
