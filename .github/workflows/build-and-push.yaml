@@ -14,7 +14,7 @@ on:
       kc_features:
         description: "Keycloak features to bake in (build-time)"
         required: false
-        default: "token-exchange-standard,token-exchange-external-internal"
+        default: "token-exchange,token-exchange-standard,token-exchange-external-internal"
       kc_http_relative_path:
         description: "Keycloak HTTP relative path to bake in (build-time)"
         required: false
@@ -27,7 +27,7 @@ on:
 env:
   IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
   DEFAULT_KEYCLOAK_VERSION: "26.5.1"
-  DEFAULT_KC_FEATURES: "token-exchange-standard,token-exchange-external-internal"
+  DEFAULT_KC_FEATURES: "token-exchange,token-exchange-standard,token-exchange-external-internal"
   DEFAULT_KC_HTTP_RELATIVE_PATH: "/"
   DEFAULT_KC_TRANSACTION_XA_ENABLED: "false"
   # Provider IDs must match AuthenticatorFactory.getId()
