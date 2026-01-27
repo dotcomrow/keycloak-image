@@ -14,7 +14,7 @@ on:
       kc_features:
         description: "Keycloak features to bake in (build-time)"
         required: false
-        default: "token-exchange"
+        default: "token-exchange,admin-fine-grained-authz"
       kc_http_relative_path:
         description: "Keycloak HTTP relative path to bake in (build-time)"
         required: false
