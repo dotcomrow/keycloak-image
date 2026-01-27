@@ -11,10 +11,25 @@ on:
         description: "Keycloak version to build/test"
         required: false
         default: "26.5.1"
+      kc_features:
+        description: "Keycloak features to bake in (build-time)"
+        required: false
+        default: "token-exchange"
+      kc_http_relative_path:
+        description: "Keycloak HTTP relative path to bake in (build-time)"
+        required: false
+        default: "/"
+      kc_transaction_xa_enabled:
+        description: "Enable XA transactions at build-time"
+        required: false
+        default: "false"
 
 env:
   IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
   DEFAULT_KEYCLOAK_VERSION: "26.5.1"
+  DEFAULT_KC_FEATURES: "token-exchange"
+  DEFAULT_KC_HTTP_RELATIVE_PATH: "/"
+  DEFAULT_KC_TRANSACTION_XA_ENABLED: "false"
   # Provider IDs must match AuthenticatorFactory.getId()
   PROVIDER_IDS: |
     github-team-admin
@@ -30,7 +45,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
 
-      - name: Resolve Keycloak version
+      - name: Resolve Keycloak build args
         run: |
           set -euo pipefail
           if [ -n "${{ inputs.keycloak_version }}" ]; then
@@ -46,6 +61,38 @@ jobs:
 
           echo "KEYCLOAK_VERSION=$KEYCLOAK_VERSION" >> "$GITHUB_ENV"
           echo "Using KEYCLOAK_VERSION=$KEYCLOAK_VERSION"
+
+          if [ -n "${{ inputs.kc_features }}" ]; then
+            KC_FEATURES="${{ inputs.kc_features }}"
+          else
+            KC_FEATURES="${{ env.DEFAULT_KC_FEATURES }}"
+          fi
+
+          if [ -n "${{ inputs.kc_http_relative_path }}" ]; then
+            KC_HTTP_RELATIVE_PATH="${{ inputs.kc_http_relative_path }}"
+          else
+            KC_HTTP_RELATIVE_PATH="${{ env.DEFAULT_KC_HTTP_RELATIVE_PATH }}"
+          fi
+
+          if [ -n "${{ inputs.kc_transaction_xa_enabled }}" ]; then
+            KC_TRANSACTION_XA_ENABLED="${{ inputs.kc_transaction_xa_enabled }}"
+          else
+            KC_TRANSACTION_XA_ENABLED="${{ env.DEFAULT_KC_TRANSACTION_XA_ENABLED }}"
+          fi
+
+          for v in KC_FEATURES KC_HTTP_RELATIVE_PATH KC_TRANSACTION_XA_ENABLED; do
+            if [ -z "${!v:-}" ]; then
+              echo "❌ Unable to resolve ${v} from inputs or defaults." >&2
+              exit 1
+            fi
+          done
+
+          echo "KC_FEATURES=$KC_FEATURES" >> "$GITHUB_ENV"
+          echo "KC_HTTP_RELATIVE_PATH=$KC_HTTP_RELATIVE_PATH" >> "$GITHUB_ENV"
+          echo "KC_TRANSACTION_XA_ENABLED=$KC_TRANSACTION_XA_ENABLED" >> "$GITHUB_ENV"
+          echo "Using KC_FEATURES=$KC_FEATURES"
+          echo "Using KC_HTTP_RELATIVE_PATH=$KC_HTTP_RELATIVE_PATH"
+          echo "Using KC_TRANSACTION_XA_ENABLED=$KC_TRANSACTION_XA_ENABLED"
 
       - name: Set up Java 24
         uses: actions/setup-java@f2beeb24e141e01a676f977032f5a29d81c9e27e
@@ -74,6 +121,9 @@ jobs:
           load: true
           build-args: |
             KEYCLOAK_VERSION=${{ env.KEYCLOAK_VERSION }}
+            KC_FEATURES=${{ env.KC_FEATURES }}
+            KC_HTTP_RELATIVE_PATH=${{ env.KC_HTTP_RELATIVE_PATH }}
+            KC_TRANSACTION_XA_ENABLED=${{ env.KC_TRANSACTION_XA_ENABLED }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 

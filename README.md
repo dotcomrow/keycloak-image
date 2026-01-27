@@ -6,8 +6,13 @@ CI proves the provider loads and can be attached to a flow via `kcadm.sh` **befo
 ## Quick start (locally)
 
 ```bash
-# build the image locally (KEYCLOAK_VERSION is required)
-docker build --build-arg KEYCLOAK_VERSION=26.5.1 -t keycloak/github-team-admin:dev .
+# build the image locally (build-time args are required)
+docker build \
+  --build-arg KEYCLOAK_VERSION=26.5.1 \
+  --build-arg KC_FEATURES=token-exchange \
+  --build-arg KC_HTTP_RELATIVE_PATH=/ \
+  --build-arg KC_TRANSACTION_XA_ENABLED=false \
+  -t keycloak/github-team-admin:dev .
 
 # run with a local Postgres
 docker network create kc-net || true
