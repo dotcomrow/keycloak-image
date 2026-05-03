@@ -187,7 +187,47 @@ public class GoogleGroupsAuthenticator implements Authenticator {
             return node != null && node.path("isMember").asBoolean(false);
         }
         if (resp.status == 404) return false;
+        // External identities can trigger "Invalid Input: memberKey" on hasMember.
+        // Fall back to direct member listing so external users can still be matched.
+        if (resp.status == 400 && isInvalidMemberKey(resp.body)) {
+            LOG.debugf("Google hasMember fallback to members.list for group=%s member=%s", groupKey, memberEmail);
+            return hasMemberViaList(session, groupKey, memberEmail);
+        }
         throw new IllegalStateException("Google Directory API error: status=" + resp.status);
+    }
+
+    private boolean hasMemberViaList(KeycloakSession session, String groupKey, String memberEmail) throws Exception {
+        String target = canonicalEmail(memberEmail);
+        String pageToken = null;
+        Set<String> seen = new HashSet<>();
+        while (true) {
+            HttpResp resp = directoryListMembers(session, accessToken(false), groupKey, pageToken);
+            if (resp.status == 401) {
+                resp = directoryListMembers(session, accessToken(true), groupKey, pageToken);
+            }
+            LOG.debugf("Google members.list -> status=%d group=%s pageToken=%s body=%s",
+                    resp.status, groupKey, pageToken, truncate(resp.body, 400));
+            if (resp.status == 404) return false;
+            if (resp.status != 200) {
+                throw new IllegalStateException("Google Directory API members.list error: status=" + resp.status);
+            }
+            JsonNode root = parseJsonQuiet(resp.body);
+            if (root == null) return false;
+            JsonNode members = root.path("members");
+            if (members.isArray()) {
+                for (JsonNode m : members) {
+                    String email = m.path("email").asText("");
+                    if (!email.isBlank() && target.equals(canonicalEmail(email))) {
+                        return true;
+                    }
+                }
+            }
+            String next = root.path("nextPageToken").asText("");
+            if (next.isBlank() || !seen.add(next)) {
+                return false;
+            }
+            pageToken = next;
+        }
     }
 
     private HttpResp directoryHasMember(KeycloakSession session, String token, String groupKey, String memberEmail) throws Exception {
@@ -199,6 +239,46 @@ public class GoogleGroupsAuthenticator implements Authenticator {
                 .header("Accept", "application/json");
         var resp = req.asResponse();
         return new HttpResp(resp.getStatus(), resp.asString());
+    }
+
+    private HttpResp directoryListMembers(KeycloakSession session, String token, String groupKey, String pageToken) throws Exception {
+        StringBuilder url = new StringBuilder(String.format(
+                "https://admin.googleapis.com/admin/directory/v1/groups/%s/members?maxResults=200",
+                urlEncode(groupKey)));
+        if (pageToken != null && !pageToken.isBlank()) {
+            url.append("&pageToken=").append(urlEncode(pageToken));
+        }
+        SimpleHttp req = SimpleHttp.doGet(url.toString(), session)
+                .header("Authorization", "Bearer " + token)
+                .header("Accept", "application/json");
+        var resp = req.asResponse();
+        return new HttpResp(resp.getStatus(), resp.asString());
+    }
+
+    private static boolean isInvalidMemberKey(String body) {
+        if (body == null) return false;
+        String normalized = body.toLowerCase(Locale.ROOT);
+        return normalized.contains("invalid input: memberkey") || normalized.contains("\"memberkey\"");
+    }
+
+    private static String canonicalEmail(String email) {
+        if (email == null) return "";
+        String normalized = email.trim().toLowerCase(Locale.ROOT);
+        int at = normalized.indexOf('@');
+        if (at <= 0 || at == normalized.length() - 1) return normalized;
+        String local = normalized.substring(0, at);
+        String domain = normalized.substring(at + 1);
+        if ("googlemail.com".equals(domain)) {
+            domain = "gmail.com";
+        }
+        if ("gmail.com".equals(domain)) {
+            int plus = local.indexOf('+');
+            if (plus >= 0) {
+                local = local.substring(0, plus);
+            }
+            local = local.replace(".", "");
+        }
+        return local + "@" + domain;
     }
 
     private static String accessToken(boolean forceRefresh) throws Exception {
