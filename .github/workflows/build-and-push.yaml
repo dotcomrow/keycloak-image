@@ -23,6 +23,10 @@ on:
         description: "Enable XA transactions at build-time"
         required: false
         default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 env:
   IMAGE_REPO: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}
