@@ -16,15 +16,16 @@ import java.util.stream.Collectors;
  * GitHub team → admin grants for Keycloak (Keycloak 24.x).
  *
  * Behavior:
- *  - If user is in GITHUB_ORG/GITHUB_TEAM (or allow-listed, or DEBUG_ALWAYS_GRANT=true),
- *    grant *all roles in the realm* (realm + all client roles).
- *  - Optional extra team→role mappings via GITHUB_ROLE_MAP (JSON).
+ *  - Optional admin-team implicit grant-all is controlled by GITHUB_ADMIN_GRANT_ALL
+ *    (default false).
+ *  - Explicit team→role mappings via GITHUB_ROLE_MAP (JSON) are always applied.
  *  - Optional excludes via GITHUB_ADMIN_EXCLUDE.
- *  - Optional revocation (GITHUB_STRICT_REVOKE=true) removes previously granted roles
- *    when user is not in the admin team; skipped for this login if the GitHub token is invalid.
+ *  - Optional revocation (GITHUB_STRICT_REVOKE=true) enforces the computed desired role set;
+ *    skipped for this login if the GitHub token is invalid.
  *
  * Env:
  *   GITHUB_ORG / GITHUB_TEAM
+ *   GITHUB_ADMIN_GRANT_ALL=true|false      (default false)
  *   DEBUG_ALWAYS_GRANT=true|false
  *   GITHUB_ADMIN_USERNAMES="a,b,c"         (optional allow-list, case-insensitive)
  *   GITHUB_STRICT_REVOKE=true|false        (default true)
@@ -50,6 +51,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
 
     private static String adminOrg()  { return getenv("GITHUB_ORG", getenv("GITHUB_ADMIN_ORG", "")).trim(); }
     private static String adminTeam() { return getenv("GITHUB_TEAM", getenv("GITHUB_ADMIN_TEAM", "")).trim(); }
+    private static boolean adminGrantAll()   { return isTrue("GITHUB_ADMIN_GRANT_ALL", false); }
     private static boolean debugAlwaysGrant() { return isTrue("DEBUG_ALWAYS_GRANT", false); }
     private static boolean strictRevoke()     { return isTrue("GITHUB_STRICT_REVOKE", true); }
     private static String roleMapJson()       { return getenv("GITHUB_ROLE_MAP", "").trim(); }
@@ -78,12 +80,13 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
 
             final String org = adminOrg();
             final String team = adminTeam();
+            final boolean flagAdminGrantAll = adminGrantAll();
             final boolean flagAlways = debugAlwaysGrant();
             final boolean flagRevoke = strictRevoke();
             final Set<String> allowUsers = adminUsernames();
 
-            LOG.infof("GitHubTeamAdminAuthenticator: start user=%s realm=%s org=%s team=%s DEBUG_ALWAYS_GRANT=%s STRICT_REVOKE=%s allowUsers=%s",
-                    user.getUsername(), realm.getName(), safe(org), safe(team), flagAlways, flagRevoke, allowUsers);
+            LOG.infof("GitHubTeamAdminAuthenticator: start user=%s realm=%s org=%s team=%s ADMIN_GRANT_ALL=%s DEBUG_ALWAYS_GRANT=%s STRICT_REVOKE=%s allowUsers=%s",
+                    user.getUsername(), realm.getName(), safe(org), safe(team), flagAdminGrantAll, flagAlways, flagRevoke, allowUsers);
 
             final String ghLogin = githubLogin(session, realm, user);
             LOG.infof("Derived GitHub login for user=%s -> '%s'", user.getUsername(), ghLogin);
@@ -92,14 +95,16 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
                     || allowUsers.contains(user.getUsername().toLowerCase(Locale.ROOT))
                     || isMemberOf(session, realm, user, ghLogin, org, team);
 
-            LOG.infof("Admin membership decision for user=%s → %s", user.getUsername(), adminMember ? "GRANT" : "NO-GRANT");
+            LOG.infof("Admin membership decision for user=%s → %s", user.getUsername(), adminMember ? "MATCHED" : "NOT-MATCHED");
 
-            // Build target role set
-            Set<RoleModel> target = new LinkedHashSet<>();
-            if (adminMember) {
+            // Build desired role set
+            Set<RoleModel> desired = new LinkedHashSet<>();
+            if (adminMember && flagAdminGrantAll) {
                 Set<RoleModel> all = allRolesInRealm(realm);
-                target.addAll(all);
-                LOG.infof("Admin grant: collected %d total roles (realm + client).", all.size());
+                desired.addAll(all);
+                LOG.infof("Admin implicit grant-all enabled: collected %d total roles (realm + client).", all.size());
+            } else if (adminMember) {
+                LOG.info("Admin team matched, but implicit grant-all is disabled; using explicit role map only.");
             }
 
             // Optional extra maps
@@ -113,7 +118,7 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
                     for (RoleSpec spec : wants) {
                         RoleModel r = resolve(realm, spec);
                         if (r != null) {
-                            target.add(r);
+                            desired.add(r);
                             LOG.debugf("Added mapped role %s due to team %s", pretty(r), key);
                         } else {
                             LOG.warnf("Mapped role not found for spec=%s team=%s", specString(spec), key);
@@ -125,33 +130,46 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             // Optional excludes
             Set<RoleSpec> excludes = parseExcludes(excludeCsv());
             if (!excludes.isEmpty()) {
-                int before = target.size();
-                target.removeIf(r -> excludeMatch(r, excludes));
-                LOG.infof("Excludes applied: removed %d role(s) from target", (before - target.size()));
+                int before = desired.size();
+                desired.removeIf(r -> excludeMatch(r, excludes));
+                LOG.infof("Excludes applied: removed %d role(s) from desired set", (before - desired.size()));
             }
 
             // Grant
-            if (!target.isEmpty()) {
-                grantIfMissing(user, target);
+            if (!desired.isEmpty()) {
+                grantIfMissing(user, desired);
             } else {
-                LOG.infof("No target roles to grant for user=%s", user.getUsername());
+                LOG.infof("No desired roles to grant for user=%s", user.getUsername());
             }
 
-            // Revoke (only when NOT admin) — but skip if token invalid this turn
+            // Revoke extras outside desired set (when strict revoke enabled),
+            // but skip this login if the GitHub token is invalid.
             boolean tokenInvalidThisTurn = "true".equals(
                     session.getContext().getAuthenticationSession().getAuthNote("GITHUB_TOKEN_INVALID"));
 
-            if (!adminMember && flagRevoke && !tokenInvalidThisTurn) {
-                Set<RoleModel> grantable = new LinkedHashSet<>(allRolesInRealm(realm));
+            if (flagRevoke && !tokenInvalidThisTurn) {
+                Set<RoleModel> managed = new LinkedHashSet<>();
+                if (flagAdminGrantAll) {
+                    managed.addAll(allRolesInRealm(realm));
+                }
                 for (List<RoleSpec> specs : map.values()) {
                     for (RoleSpec s : specs) {
                         RoleModel r = resolve(realm, s);
-                        if (r != null) grantable.add(r);
+                        if (r != null) managed.add(r);
                     }
                 }
-                if (!excludes.isEmpty()) grantable.removeIf(r -> excludeMatch(r, excludes));
-                LOG.infof("Revocation pass: considering %d role(s).", grantable.size());
-                revokeIfPresent(user, grantable);
+                if (!excludes.isEmpty()) managed.removeIf(r -> excludeMatch(r, excludes));
+
+                Set<RoleModel> revoke = new LinkedHashSet<>();
+                for (RoleModel role : managed) {
+                    if (user.hasRole(role) && !desired.contains(role)) {
+                        revoke.add(role);
+                    }
+                }
+
+                LOG.infof("Revocation pass: managed=%d desired=%d revoke=%d",
+                        managed.size(), desired.size(), revoke.size());
+                revokeIfPresent(user, revoke);
             } else if (tokenInvalidThisTurn) {
                 LOG.warn("Skipping revocation because GitHub token was INVALID (401) in this login.");
             }
