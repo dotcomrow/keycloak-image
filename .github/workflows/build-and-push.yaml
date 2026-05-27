@@ -10,7 +10,7 @@ on:
       keycloak_version:
         description: "Keycloak version to build/test"
         required: false
-        default: "26.6.1"
+        default: "26.6.2"
       kc_features:
         description: "Keycloak features to bake in (build-time)"
         required: false
