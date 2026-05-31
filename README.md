@@ -54,8 +54,15 @@ For Docker Hub (or another registry), add secrets:
 
 The authenticator **id** is: `github-team-admin`
 
-The sample implementation is a minimal pass-through authenticator so CI can prove
-load + attach mechanics. Extend it to call GitHub and grant roles as needed.
+### GitHub Team Authenticator behavior
+
+- Looks up user teams from GitHub (`org/team` keys from `/user/teams`).
+- Grants a realm role derived from team name (team slug segment after `org/`), e.g.
+  - `dotcomrow/openwebui_access` -> `openwebui_access`
+- Optional env:
+  - `GITHUB_AUTO_ROLES` (default `true`)
+  - `GITHUB_ROLE_PREFIX` (default empty)
+  - `GITHUB_STRICT_REVOKE` (default `true`)
 
 ## Google Groups Authenticator
 
@@ -70,13 +77,12 @@ checking membership against a configured list of groups.
 - `GOOGLE_ADMIN_EMAIL` (or `GOOGLE_DELEGATED_ADMIN`) — delegated admin to impersonate
 - `GOOGLE_SA_JSON_PATH` or `GOOGLE_SA_JSON` — service account JSON
 
-### Group selection and mapping
+### Group selection and role derivation
 
 - `GOOGLE_GROUPS` — CSV list of group emails to check
-- `GOOGLE_GROUP_ROLE_MAP` — JSON map of `group-email` → roles
-  - Example: `{"tier-pro@acme.com":["realm:tier_pro","client:public-app:feature_x"]}`
-- `GOOGLE_AUTO_ROLES` — `true|false` (default `true`) to auto-create `ggl:` roles per group
-- `GOOGLE_ROLE_PREFIX` — prefix for auto roles (default `ggl:`)
+- `GOOGLE_AUTO_ROLES` — `true|false` (default `true`) to auto-create roles from group name
+  - Example: `openwebui_access@yourdomain.com` -> `openwebui_access`
+- `GOOGLE_ROLE_PREFIX` — optional prefix for auto roles (default empty)
 
 ### Behavior
 

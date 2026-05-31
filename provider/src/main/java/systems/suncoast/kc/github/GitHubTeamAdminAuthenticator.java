@@ -18,7 +18,7 @@ import java.util.stream.Collectors;
  * Behavior:
  *  - Optional admin-team implicit grant-all is controlled by GITHUB_ADMIN_GRANT_ALL
  *    (default false).
- *  - Explicit team→role mappings via GITHUB_ROLE_MAP (JSON) are always applied.
+ *  - Team roles are derived directly from GitHub team slug names.
  *  - Optional excludes via GITHUB_ADMIN_EXCLUDE.
  *  - Optional revocation (GITHUB_STRICT_REVOKE=true) enforces the computed desired role set;
  *    skipped for this login if the GitHub token is invalid.
@@ -29,7 +29,8 @@ import java.util.stream.Collectors;
  *   DEBUG_ALWAYS_GRANT=true|false
  *   GITHUB_ADMIN_USERNAMES="a,b,c"         (optional allow-list, case-insensitive)
  *   GITHUB_STRICT_REVOKE=true|false        (default true)
- *   GITHUB_ROLE_MAP='{"org/team":["realm:ROLE","client:CID:ROLE"]}'
+ *   GITHUB_AUTO_ROLES=true|false           (default true)
+ *   GITHUB_ROLE_PREFIX="prefix-"           (default empty)
  *   GITHUB_ADMIN_EXCLUDE="realm:R1,client:CID:R2,R3"
  *   GITHUB_API_VERSION="2022-11-28"        (optional; X-GitHub-Api-Version)
  *   GITHUB_USER_AGENT="my-app/1.0"         (optional; User-Agent)
@@ -41,6 +42,7 @@ import java.util.stream.Collectors;
  */
 public class GitHubTeamAdminAuthenticator implements Authenticator {
     private static final Logger LOG = Logger.getLogger(GitHubTeamAdminAuthenticator.class);
+    private static final String ATTR_TEAMS = "gh.teams";
 
     // ---------- config ----------
     private static String getenv(String k, String def) { String v = System.getenv(k); return v != null ? v : def; }
@@ -52,9 +54,10 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
     private static String adminOrg()  { return getenv("GITHUB_ORG", getenv("GITHUB_ADMIN_ORG", "")).trim(); }
     private static String adminTeam() { return getenv("GITHUB_TEAM", getenv("GITHUB_ADMIN_TEAM", "")).trim(); }
     private static boolean adminGrantAll()   { return isTrue("GITHUB_ADMIN_GRANT_ALL", false); }
+    private static boolean autoRoles()       { return isTrue("GITHUB_AUTO_ROLES", true); }
     private static boolean debugAlwaysGrant() { return isTrue("DEBUG_ALWAYS_GRANT", false); }
     private static boolean strictRevoke()     { return isTrue("GITHUB_STRICT_REVOKE", true); }
-    private static String roleMapJson()       { return getenv("GITHUB_ROLE_MAP", "").trim(); }
+    private static String rolePrefix()        { return getenv("GITHUB_ROLE_PREFIX", "").trim(); }
     private static String excludeCsv()        { return getenv("GITHUB_ADMIN_EXCLUDE", "").trim(); }
     private static String apiVersion()        { return getenv("GITHUB_API_VERSION", "").trim(); }
     private static String userAgent()         { return getenv("GITHUB_USER_AGENT", "keycloak-github-admin/1.0"); }
@@ -81,9 +84,11 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             final String org = adminOrg();
             final String team = adminTeam();
             final boolean flagAdminGrantAll = adminGrantAll();
+            final boolean flagAutoRoles = autoRoles();
             final boolean flagAlways = debugAlwaysGrant();
             final boolean flagRevoke = strictRevoke();
             final Set<String> allowUsers = adminUsernames();
+            final Set<String> previousTeams = normalizeTeamKeys(user.getAttributeStream(ATTR_TEAMS).toList());
 
             LOG.infof("GitHubTeamAdminAuthenticator: start user=%s realm=%s org=%s team=%s ADMIN_GRANT_ALL=%s DEBUG_ALWAYS_GRANT=%s STRICT_REVOKE=%s allowUsers=%s",
                     user.getUsername(), realm.getName(), safe(org), safe(team), flagAdminGrantAll, flagAlways, flagRevoke, allowUsers);
@@ -104,26 +109,26 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
                 desired.addAll(all);
                 LOG.infof("Admin implicit grant-all enabled: collected %d total roles (realm + client).", all.size());
             } else if (adminMember) {
-                LOG.info("Admin team matched, but implicit grant-all is disabled; using explicit role map only.");
+                LOG.info("Admin team matched, but implicit grant-all is disabled.");
             }
 
-            // Optional extra maps
-            Map<String, List<RoleSpec>> map = parseRoleMap(roleMapJson());
-            if (!map.isEmpty()) {
-                Set<String> myTeams = fetchTeams(session, realm, user);
-                LOG.infof("Extra role map: user teams=%s", myTeams);
-                for (String key : myTeams) {
-                    List<RoleSpec> wants = map.get(key);
-                    if (wants == null) continue;
-                    for (RoleSpec spec : wants) {
-                        RoleModel r = resolve(realm, spec);
-                        if (r != null) {
-                            desired.add(r);
-                            LOG.debugf("Added mapped role %s due to team %s", pretty(r), key);
-                        } else {
-                            LOG.warnf("Mapped role not found for spec=%s team=%s", specString(spec), key);
-                        }
+            // Team-based role grants (role name derived from team slug).
+            Set<String> myTeams = Collections.emptySet();
+            if (flagAutoRoles) {
+                myTeams = fetchTeams(session, realm, user);
+                user.setAttribute(ATTR_TEAMS, new ArrayList<>(myTeams));
+            }
+            if (flagAutoRoles) {
+                for (String teamKey : myTeams) {
+                    String baseRole = roleNameFromTeamKey(teamKey);
+                    if (baseRole.isBlank()) continue;
+                    String roleName = rolePrefix() + baseRole;
+                    RoleModel role = realm.getRole(roleName);
+                    if (role == null) {
+                        role = session.roles().addRealmRole(realm, roleName);
+                        LOG.infof("Created realm role from team=%s -> role=%s", teamKey, roleName);
                     }
+                    desired.add(role);
                 }
             }
 
@@ -152,10 +157,16 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
                 if (flagAdminGrantAll) {
                     managed.addAll(allRolesInRealm(realm));
                 }
-                for (List<RoleSpec> specs : map.values()) {
-                    for (RoleSpec s : specs) {
-                        RoleModel r = resolve(realm, s);
-                        if (r != null) managed.add(r);
+                if (flagAutoRoles) {
+                    Set<String> managedTeamKeys = new LinkedHashSet<>();
+                    managedTeamKeys.addAll(previousTeams);
+                    managedTeamKeys.addAll(myTeams);
+                    for (String teamKey : managedTeamKeys) {
+                        String baseRole = roleNameFromTeamKey(teamKey);
+                        if (baseRole.isBlank()) continue;
+                        String roleName = rolePrefix() + baseRole;
+                        RoleModel role = realm.getRole(roleName);
+                        if (role != null) managed.add(role);
                     }
                 }
                 if (!excludes.isEmpty()) managed.removeIf(r -> excludeMatch(r, excludes));
@@ -329,6 +340,30 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         return out;
     }
 
+    private static Set<String> normalizeTeamKeys(List<String> rawTeams) {
+        Set<String> out = new LinkedHashSet<>();
+        if (rawTeams == null) return out;
+        for (String team : rawTeams) {
+            if (team == null) continue;
+            String normalized = team.trim().toLowerCase(Locale.ROOT);
+            if (!normalized.isBlank()) out.add(normalized);
+        }
+        return out;
+    }
+
+    private static String roleNameFromTeamKey(String teamKey) {
+        if (teamKey == null) return "";
+        String normalized = teamKey.trim().toLowerCase(Locale.ROOT);
+        if (normalized.isBlank()) return "";
+        int slash = normalized.lastIndexOf('/');
+        if (slash >= 0 && slash + 1 < normalized.length()) {
+            normalized = normalized.substring(slash + 1);
+        }
+        normalized = normalized.replaceAll("[^a-z0-9._-]+", "-");
+        normalized = normalized.replaceAll("^-+|-+$", "");
+        return normalized;
+    }
+
     // ---------- token extraction ----------
     private static final class AccessToken {
         final String token;
@@ -481,31 +516,6 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
         return null;
     }
 
-    private Map<String, List<RoleSpec>> parseRoleMap(String json) {
-        Map<String, List<RoleSpec>> out = new HashMap<>();
-        if (json == null || json.isBlank()) return out;
-        try {
-            JsonNode root = org.keycloak.util.JsonSerialization.mapper.readTree(json);
-            if (!root.isObject()) return out;
-            Iterator<String> it = root.fieldNames();
-            while (it.hasNext()) {
-                String key = it.next(); // "org/team"
-                JsonNode arr = root.get(key);
-                if (arr == null || !arr.isArray()) continue;
-                List<RoleSpec> specs = new ArrayList<>();
-                for (JsonNode n : arr) {
-                    RoleSpec s = parseRoleSpec(n.asText(""));
-                    if (s != null) specs.add(s);
-                }
-                if (!specs.isEmpty()) out.put(key.toLowerCase(Locale.ROOT), specs);
-            }
-            LOG.infof("Parsed GITHUB_ROLE_MAP for %d team key(s).", out.size());
-        } catch (Exception e) {
-            LOG.warn("Failed to parse GITHUB_ROLE_MAP; ignoring.", e);
-        }
-        return out;
-    }
-
     private Set<RoleSpec> parseExcludes(String csv) {
         Set<RoleSpec> out = new HashSet<>();
         if (csv == null || csv.isBlank()) return out;
@@ -528,13 +538,6 @@ public class GitHubTeamAdminAuthenticator implements Authenticator {
             }
         }
         return false;
-    }
-
-    private RoleModel resolve(RealmModel realm, RoleSpec spec) {
-        if (spec == null) return null;
-        if (spec.realm) return realm.getRole(spec.role);
-        ClientModel c = realm.getClientByClientId(spec.clientId);
-        return (c != null) ? c.getRole(spec.role) : null;
     }
 
     // ---------- HTTP helpers ----------

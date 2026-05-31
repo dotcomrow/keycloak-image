@@ -8,7 +8,6 @@ import org.keycloak.authentication.AuthenticationFlowContext;
 import org.keycloak.authentication.Authenticator;
 import org.keycloak.broker.provider.util.SimpleHttp;
 import org.keycloak.events.EventBuilder;
-import org.keycloak.models.ClientModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.RoleModel;
@@ -55,8 +54,7 @@ public class GoogleGroupsAuthenticator implements Authenticator {
     }
     private static boolean autoRoles() { return isTrue("GOOGLE_AUTO_ROLES", true); }
     private static boolean strictRevoke() { return isTrue("GOOGLE_STRICT_REVOKE", true); }
-    private static String rolePrefix() { return getenv("GOOGLE_ROLE_PREFIX", "ggl:"); }
-    private static String roleMapJson() { return getenv("GOOGLE_GROUP_ROLE_MAP", "").trim(); }
+    private static String rolePrefix() { return getenv("GOOGLE_ROLE_PREFIX", ""); }
     private static String adminEmail() {
         return getenv("GOOGLE_ADMIN_EMAIL", getenv("GOOGLE_DELEGATED_ADMIN", "")).trim();
     }
@@ -71,14 +69,12 @@ public class GoogleGroupsAuthenticator implements Authenticator {
         if (email == null || email.isBlank()) { ctx.attempted(); return; }
 
         RealmModel realm = ctx.getRealm();
-        Map<String, List<RoleSpec>> roleMap = parseRoleMap(roleMapJson());
         Set<String> groupsToCheck = new LinkedHashSet<>();
         groupsToCheck.addAll(parseGroupsCsv(getenv("GOOGLE_GROUPS", "")));
         groupsToCheck.addAll(parseGroupsCsv(getenv("GOOGLE_GROUP_ALLOWLIST", "")));
-        groupsToCheck.addAll(roleMap.keySet());
 
         if (groupsToCheck.isEmpty()) {
-            LOG.warn("GoogleGroupsAuthenticator: no groups configured; set GOOGLE_GROUPS or GOOGLE_GROUP_ROLE_MAP.");
+            LOG.warn("GoogleGroupsAuthenticator: no groups configured; set GOOGLE_GROUPS or GOOGLE_GROUP_ALLOWLIST.");
             ctx.success();
             return;
         }
@@ -117,27 +113,13 @@ public class GoogleGroupsAuthenticator implements Authenticator {
         Set<RoleModel> target = new LinkedHashSet<>();
         if (autoRoles()) {
             for (String g : memberGroups) {
-                String roleName = rolePrefix() + slug(g);
+                String roleName = rolePrefix() + roleNameFromGroupKey(g);
+                if (roleName.isBlank()) continue;
                 RoleModel role = realm.getRole(roleName);
                 if (role == null) {
                     role = ctx.getSession().roles().addRealmRole(realm, roleName);
                 }
                 target.add(role);
-            }
-        }
-
-        if (!roleMap.isEmpty()) {
-            for (String g : memberGroups) {
-                List<RoleSpec> wants = roleMap.get(g);
-                if (wants == null) continue;
-                for (RoleSpec spec : wants) {
-                    RoleModel r = resolve(realm, spec);
-                    if (r != null) {
-                        target.add(r);
-                    } else {
-                        LOG.warnf("Mapped role not found for spec=%s group=%s", specString(spec), g);
-                    }
-                }
             }
         }
 
@@ -149,14 +131,9 @@ public class GoogleGroupsAuthenticator implements Authenticator {
             Set<RoleModel> managed = new LinkedHashSet<>();
             if (autoRoles()) {
                 for (String g : groupsToCheck) {
-                    String roleName = rolePrefix() + slug(g);
+                    String roleName = rolePrefix() + roleNameFromGroupKey(g);
+                    if (roleName.isBlank()) continue;
                     RoleModel r = realm.getRole(roleName);
-                    if (r != null) managed.add(r);
-                }
-            }
-            for (List<RoleSpec> specs : roleMap.values()) {
-                for (RoleSpec spec : specs) {
-                    RoleModel r = resolve(realm, spec);
                     if (r != null) managed.add(r);
                 }
             }
@@ -346,8 +323,19 @@ public class GoogleGroupsAuthenticator implements Authenticator {
         return out;
     }
 
-    private static String slug(String s) {
-        return s.toLowerCase().replaceAll("[^a-z0-9]+", "-").replaceAll("(^-|-$)", "");
+    private static String roleNameFromGroupKey(String groupKey) {
+        if (groupKey == null) return "";
+        String normalized = groupKey.trim().toLowerCase(Locale.ROOT);
+        if (normalized.isBlank()) return "";
+        int atIdx = normalized.indexOf('@');
+        if (atIdx > 0) normalized = normalized.substring(0, atIdx);
+        int slashIdx = normalized.lastIndexOf('/');
+        if (slashIdx >= 0 && slashIdx + 1 < normalized.length()) {
+            normalized = normalized.substring(slashIdx + 1);
+        }
+        normalized = normalized.replaceAll("[^a-z0-9._-]+", "-");
+        normalized = normalized.replaceAll("^-+|-+$", "");
+        return normalized;
     }
 
     private static String urlEncode(String v) {
@@ -388,59 +376,6 @@ public class GoogleGroupsAuthenticator implements Authenticator {
                 user.deleteRoleMapping(r);
             }
         }
-    }
-
-    private static final class RoleSpec {
-        final boolean realm;
-        final String clientId;
-        final String role;
-        RoleSpec(boolean realm, String clientId, String role) { this.realm = realm; this.clientId = clientId; this.role = role; }
-        static RoleSpec realm(String role) { return new RoleSpec(true, null, role); }
-        static RoleSpec client(String clientId, String role) { return new RoleSpec(false, clientId, role); }
-    }
-
-    private static String specString(RoleSpec s) {
-        return s == null ? "null" : (s.realm ? "realm:" + s.role : "client:" + s.clientId + ":" + s.role);
-    }
-
-    private static RoleSpec parseRoleSpec(String spec) {
-        if (spec == null || spec.isBlank()) return null;
-        String[] parts = spec.split(":", 3);
-        if (parts.length >= 2 && "realm".equalsIgnoreCase(parts[0])) return RoleSpec.realm(parts[1]);
-        if (parts.length == 3 && "client".equalsIgnoreCase(parts[0])) return RoleSpec.client(parts[1], parts[2]);
-        if (parts.length == 1) return RoleSpec.realm(parts[0]);
-        return null;
-    }
-
-    private Map<String, List<RoleSpec>> parseRoleMap(String json) {
-        Map<String, List<RoleSpec>> out = new HashMap<>();
-        if (json == null || json.isBlank()) return out;
-        try {
-            JsonNode root = org.keycloak.util.JsonSerialization.mapper.readTree(json);
-            if (!root.isObject()) return out;
-            Iterator<String> it = root.fieldNames();
-            while (it.hasNext()) {
-                String key = it.next().toLowerCase(Locale.ROOT);
-                JsonNode arr = root.get(key);
-                if (arr == null || !arr.isArray()) continue;
-                List<RoleSpec> specs = new ArrayList<>();
-                for (JsonNode n : arr) {
-                    RoleSpec s = parseRoleSpec(n.asText(""));
-                    if (s != null) specs.add(s);
-                }
-                if (!specs.isEmpty()) out.put(key, specs);
-            }
-        } catch (Exception e) {
-            LOG.warn("Failed to parse GOOGLE_GROUP_ROLE_MAP; ignoring.", e);
-        }
-        return out;
-    }
-
-    private RoleModel resolve(RealmModel realm, RoleSpec spec) {
-        if (spec == null) return null;
-        if (spec.realm) return realm.getRole(spec.role);
-        ClientModel c = realm.getClientByClientId(spec.clientId);
-        return (c != null) ? c.getRole(spec.role) : null;
     }
 
     @Override public void action(AuthenticationFlowContext ctx) { }
