@@ -1,7 +1,9 @@
-# Keycloak with Custom GitHub Team Admin Authenticator (Provable CI)
+# Keycloak with Dynamic IdP Membership Providers (Provable CI)
 
-This repo builds a Keycloak image that **bakes in** a custom Authenticator SPI (`github-team-admin`).
-CI proves the provider loads and can be attached to a flow via `kcadm.sh` **before pushing** the image.
+This repo builds a Keycloak image that **bakes in** custom Authenticator + Realm Resource SPIs for
+dynamic role resolution from identity-provider membership.
+
+CI proves providers load and can be attached to a flow via `kcadm.sh` **before pushing** the image.
 
 ## Quick start (locally)
 
@@ -50,47 +52,59 @@ For Docker Hub (or another registry), add secrets:
 - `REGISTRY_USERNAME`
 - `REGISTRY_PASSWORD`
 
-## Provider ID
+## Provider IDs
 
-The authenticator **id** is: `github-team-admin`
+- Authenticator: `github-team-admin`
+- Authenticator: `google-groups-authenticator`
+- Realm endpoint provider: `suncoast-memberships`
 
-### GitHub Team Authenticator behavior
+### GitHub Membership Resolver behavior
 
 - Looks up user teams from GitHub (`org/team` keys from `/user/teams`).
-- Grants a realm role derived from team name (team slug segment after `org/`), e.g.
+- Derives role names directly from team slug (team segment after `org/`), e.g.
   - `dotcomrow/openwebui_access` -> `openwebui_access`
+- Does **not** create/grant/revoke Keycloak role mappings.
 - Optional env:
-  - `GITHUB_AUTO_ROLES` (default `true`)
-  - `GITHUB_ROLE_PREFIX` (default empty)
-  - `GITHUB_STRICT_REVOKE` (default `true`)
+  - `GITHUB_MEMBERSHIP_ENABLED` (default `true`)
+  - `GITHUB_API_VERSION` (optional, forwarded as `X-GitHub-Api-Version`)
+  - `GITHUB_USER_AGENT` (optional, default `keycloak-github-membership-resolver/1.0`)
 
-## Google Groups Authenticator
-
-Provider **id**: `google-groups-authenticator`
+### Google Membership Resolver behavior
 
 Fetches Cloud Identity / Google Workspace group membership at login using a
-service account with domain-wide delegation. It supports external users by
-checking membership against a configured list of groups.
+service account with domain-wide delegation.
 
 ### Required env
 
 - `GOOGLE_ADMIN_EMAIL` (or `GOOGLE_DELEGATED_ADMIN`) — delegated admin to impersonate
 - `GOOGLE_SA_JSON_PATH` or `GOOGLE_SA_JSON` — service account JSON
 
-### Group selection and role derivation
-
-- `GOOGLE_GROUPS` — CSV list of group emails to check
-- `GOOGLE_AUTO_ROLES` — `true|false` (default `true`) to auto-create roles from group name
-  - Example: `openwebui_access@yourdomain.com` -> `openwebui_access`
-- `GOOGLE_ROLE_PREFIX` — optional prefix for auto roles (default empty)
-
 ### Behavior
 
-- `GOOGLE_STRICT_REVOKE` — `true|false` (default `true`) revoke managed roles if no longer in group
-- `GOOGLE_GROUPS_TTL_SECONDS` — cache TTL (default `600`)
+- Lists groups for the logged-in user via Directory API `groups.list?userKey=<email>`.
+- Derives role names directly from group key, e.g. `openwebui_access@yourdomain.com` -> `openwebui_access`.
+- Does **not** create/grant/revoke Keycloak role mappings.
+- Optional env:
+  - `GOOGLE_MEMBERSHIP_ENABLED` (default `true`)
 
 ### Admin SDK scopes
 
 Ensure the service account is authorized for:
 - `https://www.googleapis.com/auth/admin.directory.group.readonly`
 - `https://www.googleapis.com/auth/admin.directory.group.member.readonly`
+
+## Membership Endpoint
+
+This image exposes:
+
+- `GET /realms/{realm}/suncoast-memberships/me`
+
+It returns:
+
+- effective role list resolved from current IdP membership
+- per-source diagnostics (`github`, `google`) with membership keys and derived roles
+
+Authentication supports either:
+
+- bearer token, or
+- Keycloak identity cookie session
