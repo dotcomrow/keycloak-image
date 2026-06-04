@@ -108,3 +108,17 @@ Authentication supports either:
 
 - bearer token, or
 - Keycloak identity cookie session
+
+## Membership Token Mapper
+
+Provider ID:
+
+- `suncoast-membership-roles-mapper`
+
+Behavior:
+
+- Emits normalized IdP membership roles into an OIDC claim, usually `suncoast_roles`.
+- Uses cached user attributes populated by the GitHub/Google authenticators.
+- Refreshes the cached GitHub/Google membership during token issuance when the cache is stale.
+- Default cache TTL is 300 seconds and can be overridden by mapper config `cache.ttl.seconds` or `SUNCOAST_MEMBERSHIP_TOKEN_CACHE_TTL_SECONDS`.
+- Does not read or emit Keycloak realm role mappings, so stale direct Keycloak roles do not grant app/page/MFE access through this claim.

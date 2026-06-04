@@ -8,11 +8,7 @@ import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 import systems.suncoast.kc.membership.GoogleMembershipResolver;
 import systems.suncoast.kc.membership.IdpMembershipResult;
-
-import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
+import systems.suncoast.kc.membership.MembershipAttributeCache;
 
 /**
  * Resolves Google group memberships and stores the current snapshot on user attributes.
@@ -22,10 +18,6 @@ import java.util.List;
 public class GoogleGroupsAuthenticator implements Authenticator {
     private static final Logger LOG = Logger.getLogger(GoogleGroupsAuthenticator.class);
     private static final GoogleMembershipResolver RESOLVER = new GoogleMembershipResolver();
-
-    private static final String ATTR_GROUPS = "ggl.groups";
-    private static final String ATTR_ROLES = "ggl.roles";
-    private static final String ATTR_TS = "ggl.cachedAt";
 
     @Override
     public void authenticate(AuthenticationFlowContext ctx) {
@@ -42,9 +34,7 @@ public class GoogleGroupsAuthenticator implements Authenticator {
             IdpMembershipResult google = RESOLVER.resolve(session, realm, user);
 
             if (google != null) {
-                user.setAttribute(ATTR_GROUPS, toMutableList(google.membershipsList()));
-                user.setAttribute(ATTR_ROLES, toMutableList(google.rolesList()));
-                user.setSingleAttribute(ATTR_TS, Long.toString(Instant.now().getEpochSecond()));
+                MembershipAttributeCache.storeSourceResult(user, google);
                 LOG.infof(
                         "Google membership resolved for user=%s attempted=%s success=%s groups=%d roles=%d message=%s",
                         user.getUsername(),
@@ -55,9 +45,6 @@ public class GoogleGroupsAuthenticator implements Authenticator {
                         google.message()
                 );
             } else {
-                user.setAttribute(ATTR_GROUPS, Collections.emptyList());
-                user.setAttribute(ATTR_ROLES, Collections.emptyList());
-                user.setSingleAttribute(ATTR_TS, Long.toString(Instant.now().getEpochSecond()));
                 LOG.warnf("Google membership resolver result missing for user=%s", user.getUsername());
             }
 
@@ -66,13 +53,6 @@ public class GoogleGroupsAuthenticator implements Authenticator {
             LOG.warn("GoogleGroupsAuthenticator failed; keeping flow non-blocking", e);
             ctx.success();
         }
-    }
-
-    private static List<String> toMutableList(List<String> values) {
-        if (values == null || values.isEmpty()) {
-            return new ArrayList<>();
-        }
-        return new ArrayList<>(values);
     }
 
     @Override
