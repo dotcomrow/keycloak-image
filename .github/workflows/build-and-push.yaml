@@ -145,7 +145,7 @@ jobs:
             -e POSTGRES_PASSWORD=keycloak \
             -e POSTGRES_DB=keycloak \
             -p 5432:5432 \
-            postgres:15
+            postgres:18
           for i in {1..60}; do
             docker exec kc-db pg_isready -U keycloak -d keycloak && break || sleep 2
           done
@@ -269,6 +269,31 @@ jobs:
                   END {exit (found?0:1)}'
             echo "✅ Provider '$PROVIDER_ID' present and REQUIRED under flow '$FLOW'."
           done
+
+          echo "=== Testing stable identity protocol mapper ==="
+          CLIENT_ID="ci-stable-identity"
+          CLIENT_UUID=$(docker exec kc /opt/keycloak/bin/kcadm.sh create clients -r "$REALM" \
+            -s "clientId=$CLIENT_ID" -s enabled=true -s publicClient=true \
+            -s directAccessGrantsEnabled=true -s standardFlowEnabled=false -i)
+          docker exec kc /opt/keycloak/bin/kcadm.sh create "clients/$CLIENT_UUID/protocol-mappers/models" -r "$REALM" \
+            -s name=suncoast-stable-identity \
+            -s protocol=openid-connect \
+            -s protocolMapper=suncoast-stable-identity-mapper \
+            -s 'config."claim.name"=suncoast_identity_id' \
+            -s 'config."jsonType.label"=String' \
+            -s 'config."access.token.claim"=true' \
+            -s 'config."id.token.claim"=true' \
+            -s 'config."userinfo.token.claim"=true'
+          docker exec kc /opt/keycloak/bin/kcadm.sh create users -r "$REALM" \
+            -s username=ci-stable-user -s enabled=true -s 'attributes.github_id=["123456789"]'
+          docker exec kc /opt/keycloak/bin/kcadm.sh set-password -r "$REALM" \
+            --username ci-stable-user --new-password ci-stable-password
+          ACCESS_TOKEN=$(curl -fsS http://localhost:8080/realms/$REALM/protocol/openid-connect/token \
+            -d grant_type=password -d client_id="$CLIENT_ID" \
+            -d username=ci-stable-user -d password=ci-stable-password | jq -r .access_token)
+          PAYLOAD=$(python3 -c 'import base64,json,sys; part=sys.argv[1].split(".")[1]; print(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)).decode())' "$ACCESS_TOKEN")
+          printf '%s' "$PAYLOAD" | jq -e '.suncoast_identity_id == "github:123456789"'
+          echo "✅ Stable identity mapper emitted github:123456789."
 
       - name: Log in to GHCR (for push)
         if: ${{ github.event_name != 'pull_request' }}

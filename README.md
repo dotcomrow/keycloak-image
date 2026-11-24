@@ -3,6 +3,12 @@
 This repo builds a Keycloak image that **bakes in** custom Authenticator + Realm Resource SPIs for
 dynamic role resolution from identity-provider membership.
 
+The image also provides the `suncoast-stable-identity-mapper` protocol mapper.
+It emits `suncoast_identity_id` from the durable external identity
+(`github:<numeric-id>` or `google:<sub>`), and uses
+`service:<realm>:<client-id>` for service accounts. Applications must not
+persist Keycloak's generated user UUID as their person identifier.
+
 CI proves providers load and can be attached to a flow via `kcadm.sh` **before pushing** the image.
 
 ## Quick start (locally)
