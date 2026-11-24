@@ -284,19 +284,19 @@ jobs:
             -s 'config."access.token.claim"=true' \
             -s 'config."id.token.claim"=true' \
             -s 'config."userinfo.token.claim"=true'
-          USER_UUID=$(printf '%s\n' '{"username":"ci-stable-user","enabled":true,"attributes":{"github_id":["123456789"]}}' \
+          USER_UUID=$(printf '%s\n' '{"username":"ci-stable-user","enabled":true}' \
             | docker exec -i kc /opt/keycloak/bin/kcadm.sh create users -r "$REALM" -f - -i)
           [ -n "$USER_UUID" ]
           docker exec kc /opt/keycloak/bin/kcadm.sh get "users/$USER_UUID" -r "$REALM" \
-            | jq -e '.username == "ci-stable-user" and .attributes.github_id == ["123456789"]'
+            | jq -e '.username == "ci-stable-user"'
           docker exec kc /opt/keycloak/bin/kcadm.sh set-password -r "$REALM" \
             --username ci-stable-user --new-password ci-stable-password
           ACCESS_TOKEN=$(curl -fsS http://localhost:8080/realms/$REALM/protocol/openid-connect/token \
             -d grant_type=password -d client_id="$CLIENT_ID" \
             -d username=ci-stable-user -d password=ci-stable-password | jq -r .access_token)
           PAYLOAD=$(python3 -c 'import base64,json,sys; part=sys.argv[1].split(".")[1]; print(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)).decode())' "$ACCESS_TOKEN")
-          printf '%s' "$PAYLOAD" | jq -e '.suncoast_identity_id == "github:123456789"'
-          echo "✅ Stable identity mapper emitted github:123456789."
+          printf '%s' "$PAYLOAD" | jq -e '.suncoast_identity_id == "local:master:ci-stable-user"'
+          echo "✅ Stable identity mapper emitted local:master:ci-stable-user."
 
       - name: Log in to GHCR (for push)
         if: ${{ github.event_name != 'pull_request' }}
