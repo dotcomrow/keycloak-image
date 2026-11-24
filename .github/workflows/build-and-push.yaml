@@ -284,12 +284,11 @@ jobs:
             -s 'config."access.token.claim"=true' \
             -s 'config."id.token.claim"=true' \
             -s 'config."userinfo.token.claim"=true'
-          printf '%s\n' '{"username":"ci-stable-user","enabled":true,"attributes":{"github_id":["123456789"]}}' \
-            | docker exec -i kc /opt/keycloak/bin/kcadm.sh create users -r "$REALM" -f -
-          USER_UUID=$(docker exec kc /opt/keycloak/bin/kcadm.sh get users -r "$REALM" \
-            -q username=ci-stable-user --fields id,username,attributes \
-            | jq -er '.[] | select(.username == "ci-stable-user" and .attributes.github_id == ["123456789"]) | .id')
+          USER_UUID=$(printf '%s\n' '{"username":"ci-stable-user","enabled":true,"attributes":{"github_id":["123456789"]}}' \
+            | docker exec -i kc /opt/keycloak/bin/kcadm.sh create users -r "$REALM" -f - -i)
           [ -n "$USER_UUID" ]
+          docker exec kc /opt/keycloak/bin/kcadm.sh get "users/$USER_UUID" -r "$REALM" \
+            | jq -e '.username == "ci-stable-user" and .attributes.github_id == ["123456789"]'
           docker exec kc /opt/keycloak/bin/kcadm.sh set-password -r "$REALM" \
             --username ci-stable-user --new-password ci-stable-password
           ACCESS_TOKEN=$(curl -fsS http://localhost:8080/realms/$REALM/protocol/openid-connect/token \
